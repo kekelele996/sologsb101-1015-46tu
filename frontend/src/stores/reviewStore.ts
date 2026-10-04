@@ -103,9 +103,10 @@ export const useReviewStore = defineStore('review', () => {
       trend: draft.trend,
       conclusion: draft.conclusion.trim(),
       followUp: draft.followUp.trim(),
+      ownerSide: 'bureau',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     }
     await putReview(row)
     revision.value += 1

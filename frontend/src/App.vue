@@ -43,6 +43,8 @@ const activePath = computed<string>(() => {
 })
 
 const overdueCount = computed<number>(() => treeStore.overdueSupports.length)
+const recheckCount = computed<number>(() => treeStore.crewRecheckCount)
+const queuedCount = computed<number>(() => treeStore.queuedMeasures.length)
 
 onMounted(() => {
   void treeStore.loadAll()
@@ -86,6 +88,8 @@ function go(path: string): void {
         </el-tag>
         <el-tag v-else type="info">未选择古树</el-tag>
         <el-tag v-if="overdueCount > 0" type="danger" effect="dark">加固件超期 {{ overdueCount }} 件</el-tag>
+        <el-tag v-if="recheckCount > 0" type="warning" effect="dark">级别调整待重排 {{ recheckCount }} 项</el-tag>
+        <el-tag v-if="queuedCount > 0" type="info" effect="dark">措施排队 {{ queuedCount }} 项</el-tag>
       </div>
     </header>
 

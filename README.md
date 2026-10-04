@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22815） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbheritagetree`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbheritagetree`，含 v1 → v2 → v3 升级迁移 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -100,27 +100,30 @@ sologsb101-1015/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbheritagetree`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * `surveys` 增加 `[treeId+date]` 复合索引、`measures` 增加 `operator` 索引、`supports` 增加 `lastCheckDate` 索引、`reviews` 增加 `trend` 索引；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `trees` 补齐 `lastMeasureDate`（最近复壮日期）回写字段；
-  * 为 `reviews` 补齐 `followUp`（后续措施）字段；
-  * 为 `supports` 补齐 `lastCheckDate` 与 `checkCycleMon` 缺省值。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，`version(3)` 完成两份档案拆归属：
+  * v2 迁移：`surveys` 增加 `[treeId+date]` 复合索引、`measures` 增加 `operator` 索引、`supports` 增加 `lastCheckDate` 索引、`reviews` 增加 `trend` 索引；回填 `revision` / `createdAt` / `updatedAt`、`trees.lastMeasureDate`、`reviews.followUp`、`supports.lastCheckDate/checkCycleMon`；
+  * **v3 迁移（两份档案拆分）**：每条记录补 `ownerSide` 归属章（检查 / 措施 / 加固件 / 检查任务 = 养护班组，复评 = 保护科）；新增 `inspections` 检查任务表（按旧数据回填待办树体检查与加固件检查）；措施补 `workdays` / `planYear` / `queueOrder` / `queueReason`；加固件补 `basisLevel`；古树补 `levelChangedDate`。**历史数据没有归属，升级时按现有档案统一回填后再启用**。
+* **两份档案的归属边界（谁也改不到对方那份）**：
+  * 养护班组（`ownerSide = crew`）：树体检查 `surveys`、复壮措施 `measures`、加固件 `supports`、检查任务 `inspections`；
+  * 古树保护科（`ownerSide = bureau`）：保护级别 `trees.protectLevel`、长势复评 `reviews`；
+  * 古树主档是双方共享的档案锚点：保护科在自己的事务里改 `protectLevel`，班组在自己的事务里回写 `lastMeasureDate`；写入时强制校验归属章（`OwnershipError`），跨侧改写直接拒绝；任一侧提交失败只回滚自己那份。
 * **表结构**：
 
-  | 表 | 主键 | 主要索引 |
-  | --- | --- | --- |
-  | `trees` | id | code, species, protectLevel, ageYears, createdAt, updatedAt, owner |
-  | `surveys` | id | treeId, [treeId+date], date, siteNote |
-  | `measures` | id | treeId, type, state, date, operator |
-  | `supports` | id | treeId, type, installDate, lastCheckDate |
-  | `reviews` | id | treeId, date, vigor, trend |
+  | 表 | 主键 | 归属 | 主要索引 |
+  | --- | --- | --- | --- |
+  | `trees` | id | 共享锚点（级别归保护科） | code, species, protectLevel, levelChangedDate, ageYears, createdAt, updatedAt, owner |
+  | `surveys` | id | 养护班组 | treeId, [treeId+date], date, siteNote, ownerSide |
+  | `measures` | id | 养护班组 | treeId, type, state, date, operator, ownerSide, [treeId+planYear] |
+  | `supports` | id | 养护班组 | treeId, type, installDate, lastCheckDate, ownerSide, basisLevel |
+  | `reviews` | id | 古树保护科 | treeId, date, vigor, trend, ownerSide |
+  | `inspections` | id | 养护班组 | treeId, kind, status, dueDate, supportId, voided, ownerSide, [treeId+kind] |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `trees` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **古树 → 树体检查 / 复壮措施 / 加固件 / 长势复评** 三层互相引用：
-  * 3 株古树（京-01-0007 国槐 一级 / 京-02-0113 银杏 一级 / 京-05-0246 侧柏 二级）；
-  * 9 条树体检查（每株 3 次，树高胸径随日期递增）、8 条复壮措施（覆盖计划 / 实施中 / 已完成）、
-    5 件加固件（其中 **京-01-0007 支撑杆** 与 **京-05-0246 避雷** 故意超周期未检查，用于验证高亮与提醒）、
+  * 3 株古树（京-01-0007 国槐 一级 / 京-02-0113 银杏 一级 / 京-05-0246 侧柏 **2026-01-05 由二级升一级**）；
+  * 9 条树体检查（每株 3 次，树高胸径随日期递增）、11 条复壮措施（覆盖计划 / 实施中 / 已完成 / **排队待批**，含工日核定）、
+    5 件加固件（侧柏 2 件仍按旧二级核定，用于验证级别调整后的待重排流程）、
+    检查任务（含**已失效待重排**与**已完成照旧留住**样本）、
     7 条长势复评（含衰弱 / 濒危样本且均已填写后续措施）。
   * 固定 id 如 `tree-guozijian-0007`、`tree-xiangshan-0113`、`tree-ritan-0246` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的古树 id」这一界面偏好，不存业务数据。
@@ -155,3 +158,17 @@ npm run preview      # 预览 dist 产物
   「登记本次检查」会把最近检查日期置为今天并解除高亮。
 * **复评强制校验**：长势为「衰弱」或「濒危」时，后续措施为必填项，未填写无法保存。
 * **措施回写**：复壮措施状态改为「已完成」时，若实施日期晚于古树现有最近复壮日期，则自动回写该日期。
+* **两份档案归属**：树体检查 / 复壮措施 / 加固件 / 检查任务归养护班组，保护级别 / 长势复评归古树保护科；
+  古树编辑表单中保护级别只读，统一走复评页「保护级别调整」流程（可同期登记复评结论）。
+* **级别调整 → 检查失效（做完的留住）**：保护科调整保护级别只提交保护科事务（级别 + 复评），
+  随后在班组侧把按旧级别排出的**待办**检查任务挑出置为「已失效」，列表高亮并等班组按新级别一键重排；
+  已完成的检查记录与已完成检查任务不受影响。班组侧挑取失败不回滚已生效的级别调整，可重试。
+* **按级别核定工日与容量排队**：当年复壮施工工日按保护级别核定（一级 40 / 二级 24 / 三级 12 工日·株·年，
+  各措施类型另有默认工日）；班组排出的「计划」措施超出当年容量时自动转为「排队待批」等下一批，
+  已确认（实施中 / 已完成）措施占用的容量不被挤掉；容量空出后可按排队顺序「尝试排入」。
+
+### 规则验证
+
+```bash
+npm run verify:rules   # fake-indexeddb 驱动：迁移回填 / 归属隔离 / 级别失效 / 容量排队 / 单侧回滚
+```

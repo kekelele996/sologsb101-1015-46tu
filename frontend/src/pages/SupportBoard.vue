@@ -1,8 +1,10 @@
 <script setup lang="ts">
 /**
- * /supports 支撑加固与避雷件登记
+ * /supports 支撑加固与避雷件登记（养护班组那份档案）
+ * 检查周期由古树保护科按保护级别核定；保护级别一调整，按旧级别排出的加固件检查即失效，
+ * 列表中挑出待班组按新级别「重排检查」，已完成的检查历史照旧留住；
  * 超周期未检查的加固件自动高亮并生成检查提醒，支持一键登记本次检查。
- * 消费模型：Support、Tree；复用组件：<StatBadge>、<EmptyPanel>、<FilterBar>、<VigorTag>
+ * 消费模型：Support、Inspection、Tree；复用组件：<StatBadge>、<EmptyPanel>、<FilterBar>、<VigorTag>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -12,14 +14,32 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import VigorTag from '@/components/common/VigorTag.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useTreeStore } from '@/stores/treeStore'
-import { db, markSupportChecked } from '@/utils/db'
+import { db, markSupportChecked, putSupport, rescheduleSupportCheck, ROW_REVISION } from '@/utils/db'
+import { policyOf } from '@/types/policy'
 import { SUPPORT_TYPE_OPTIONS, type Support, type SupportDraft, type SupportType } from '@/types/support'
+import { type Inspection } from '@/types/inspection'
 import { isSupportOverdue, nextCheckDate, overdueDays } from '@/utils/dimension'
-import { today } from '@/utils/id'
+import { today, nowIso, uuid } from '@/utils/id'
 
 const treeStore = useTreeStore()
 
-const { rows, loading, create, update, remove } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
+const { rows, loading, remove } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
+
+/** 当前级别核定的加固件检查周期（月） */
+function cycleForTree(treeId: string): number {
+  const tree = treeStore.trees.find((item) => item.id === treeId)
+  return tree ? policyOf(tree.protectLevel).supportCheckCycleMon : 12
+}
+
+function isStale(row: Support): boolean {
+  const tree = treeStore.trees.find((item) => item.id === row.treeId)
+  return tree !== undefined && row.basisLevel !== tree.protectLevel
+}
+
+/** 该加固件关联的已失效检查任务（级别调整后挑出，等班组重排） */
+function voidedTasksOf(supportId: string): Inspection[] {
+  return treeStore.inspections.filter((task) => task.supportId === supportId && task.voided)
+}
 
 const keyword = ref('')
 const treeFilter = ref('all')
@@ -39,6 +59,12 @@ const form = reactive<SupportDraft>({
   lastCheckDate: '',
 })
 
+/** 表单中选中古树对应的当前核定周期（级别调整后登记新加固件即按新级别） */
+const formCycle = computed<number>(() => cycleForTree(form.treeId))
+
+/** 失效待重排的加固件（其检查周期仍停留在旧保护级别） */
+const staleRows = computed<Support[]>(() => rows.value.filter(isStale))
+
 const rules: FormRules<SupportDraft> = {
   treeId: [{ required: true, message: '请选择古树', trigger: 'change' }],
   type: [{ required: true, message: '请选择加固件类型', trigger: 'change' }],
@@ -56,7 +82,7 @@ const filtered = computed<Support[]>(() => {
     .filter((row) => {
       if (treeFilter.value !== 'all' && row.treeId !== treeFilter.value) return false
       if (typeFilter.value !== 'all' && row.type !== typeFilter.value) return false
-      if (overdueOnly.value && !isSupportOverdue(row.lastCheckDate, row.checkCycleMon)) return false
+      if (overdueOnly.value && (isStale(row) || !isSupportOverdue(row.lastCheckDate, row.checkCycleMon))) return false
       if (key === '') return true
       return (
         (treeLabel.value[row.treeId] ?? '').toLowerCase().includes(key) ||
@@ -68,7 +94,7 @@ const filtered = computed<Support[]>(() => {
 })
 
 const overdueRows = computed<Support[]>(() =>
-  rows.value.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+  rows.value.filter((row) => !isStale(row) && isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
 )
 
 const coveredTrees = computed<number>(() => new Set(rows.value.map((row) => row.treeId)).size)
@@ -78,6 +104,7 @@ onMounted(() => {
 })
 
 function rowClassName({ row }: { row: Support }): string {
+  if (isStale(row)) return 'row-stale'
   return isSupportOverdue(row.lastCheckDate, row.checkCycleMon) ? 'row-overdue' : ''
 }
 
@@ -89,7 +116,7 @@ function openCreate(): void {
     treeId,
     type: '支撑杆' as SupportType,
     installDate: today(),
-    checkCycleMon: 12,
+    checkCycleMon: cycleForTree(treeId),
     lastCheckDate: today(),
   })
   dialogVisible.value = true
@@ -114,10 +141,28 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await create({ ...form }, 'support')
-      ElMessage.success('加固件已登记')
+      const stamp = nowIso()
+      // 班组登记新加固件：归属 crew，检查周期按当前保护级别核定
+      await putSupport({
+        id: uuid('support'),
+        ...form,
+        checkCycleMon: formCycle.value,
+        basisLevel: treeStore.trees.find((item) => item.id === form.treeId)?.protectLevel ?? '二级',
+        ownerSide: 'crew',
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      })
+      ElMessage.success(`加固件已登记，检查周期按当前保护级别核定为 ${formCycle.value} 个月`)
     } else {
-      await update(editingId.value, { ...form })
+      const existing = await db.supports.get(editingId.value)
+      if (existing) {
+        await putSupport({
+          ...existing,
+          ...form,
+          basisLevel: existing.basisLevel,
+        })
+      }
       ElMessage.success('加固件已更新')
     }
     dialogVisible.value = false
@@ -125,6 +170,25 @@ async function handleSubmit(): Promise<void> {
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   } finally {
     submitting.value = false
+  }
+}
+
+/** 班组按新级别重排加固件检查：旧待办已失效留痕，重排产生新的待办任务 */
+async function handleReschedule(row: Support): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `「${treeLabel.value[row.treeId] ?? row.treeId} · ${row.type}」的检查周期仍按${row.basisLevel}核定，将按当前保护级别重排检查（已完成的检查历史保留）。`,
+      '按新级别重排加固件检查？',
+      { type: 'warning', confirmButtonText: '重排', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    const task = await rescheduleSupportCheck(row.id)
+    ElMessage.success(`已按新级别重排，下次检查日期：${task.dueDate}`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '重排失败')
   }
 }
 
@@ -163,15 +227,44 @@ function handleFilterChange(key: string, value: string): void {
         suffix="件"
         :tone="overdueRows.length > 0 ? 'danger' : 'success'"
         icon="Warning"
-        hint="超过检查周期（月）仍未登记检查的加固件"
+        hint="超过检查周期（月）仍未登记检查的加固件（待重排的除外）"
+      />
+      <StatBadge
+        label="级别调整待重排"
+        :value="staleRows.length"
+        suffix="件"
+        :tone="staleRows.length > 0 ? 'warning' : 'success'"
+        icon="RefreshRight"
+        hint="保护级别调整后检查周期失效，等班组按新级别重排检查"
       />
       <StatBadge label="覆盖古树" :value="coveredTrees" suffix="株" tone="info" icon="DataLine" />
       <StatBadge label="筛选结果" :value="filtered.length" suffix="件" tone="default" icon="PieChart" size="small" />
     </div>
 
     <el-alert
-      v-if="overdueRows.length > 0"
+      v-if="staleRows.length > 0"
       type="warning"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${staleRows.length} 件加固件的检查周期仍按旧保护级别核定，需要班组按新级别重排`"
+    >
+      <template #default>
+        <div class="overdue-list">
+          <div v-for="row in staleRows" :key="row.id">
+            {{ treeLabel[row.treeId] ?? '（古树已删除）' }} · {{ row.type }}：原按
+            {{ row.basisLevel }} / {{ row.checkCycleMon }} 个月，现古树为
+            {{ treeStore.trees.find((tree) => tree.id === row.treeId)?.protectLevel }} /
+            {{ cycleForTree(row.treeId) }} 个月
+            <el-button link type="warning" size="small" @click="handleReschedule(row)">立即重排</el-button>
+          </div>
+        </div>
+      </template>
+    </el-alert>
+
+    <el-alert
+      v-if="overdueRows.length > 0"
+      type="error"
       show-icon
       :closable="false"
       class="mb-14"
@@ -264,8 +357,11 @@ function handleFilterChange(key: string, value: string): void {
           </template>
         </el-table-column>
         <el-table-column prop="installDate" label="安装日期" width="120" />
-        <el-table-column label="检查周期" width="110" align="right">
-          <template #default="{ row }">{{ row.checkCycleMon }} 个月</template>
+        <el-table-column label="检查周期" width="150" align="right">
+          <template #default="{ row }">
+            <div>{{ row.checkCycleMon }} 个月</div>
+            <div class="cell-sub">按 {{ row.basisLevel || '—' }} 核定</div>
+          </template>
         </el-table-column>
         <el-table-column label="最近检查" width="130">
           <template #default="{ row }">
@@ -276,17 +372,33 @@ function handleFilterChange(key: string, value: string): void {
         <el-table-column label="下次检查" width="130">
           <template #default="{ row }">{{ nextCheckDate(row.lastCheckDate, row.checkCycleMon) || '—' }}</template>
         </el-table-column>
-        <el-table-column label="检查状态" width="180">
+        <el-table-column label="检查状态" width="190">
           <template #default="{ row }">
-            <el-tag v-if="isSupportOverdue(row.lastCheckDate, row.checkCycleMon)" type="danger" effect="dark">
+            <el-tag v-if="isStale(row)" type="warning" effect="dark">
+              级别调整待重排
+            </el-tag>
+            <el-tag v-else-if="isSupportOverdue(row.lastCheckDate, row.checkCycleMon)" type="danger" effect="dark">
               超期 {{ overdueDays(row.lastCheckDate, row.checkCycleMon) }} 天
             </el-tag>
             <el-tag v-else type="success" effect="light">周期内</el-tag>
+            <div v-if="voidedTasksOf(row.id).length > 0" class="cell-sub">
+              {{ voidedTasksOf(row.id).length }} 个旧待办已失效
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="340" fixed="right">
           <template #default="{ row }">
             <el-button
+              v-if="isStale(row)"
+              link
+              type="warning"
+              size="small"
+              @click="handleReschedule(row)"
+            >
+              按新级别重排
+            </el-button>
+            <el-button
+              v-else
               link
               :type="isSupportOverdue(row.lastCheckDate, row.checkCycleMon) ? 'danger' : 'primary'"
               size="small"
@@ -329,8 +441,8 @@ function handleFilterChange(key: string, value: string): void {
         </el-row>
         <el-row :gutter="12">
           <el-col :span="12">
-            <el-form-item label="检查周期（月）" prop="checkCycleMon">
-              <el-input-number v-model="form.checkCycleMon" :min="1" :max="120" :step="1" style="width: 100%" />
+            <el-form-item label="检查周期（月）">
+              <el-input :model-value="`${formCycle} 个月（按当前保护级别核定）`" disabled />
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -343,8 +455,8 @@ function handleFilterChange(key: string, value: string): void {
           type="info"
           show-icon
           :closable="false"
-          :title="`下次检查日期：${nextCheckDate(form.lastCheckDate, form.checkCycleMon) || '请先填写最近检查日期'}`"
-          description="超过下次检查日期仍未登记检查的加固件，会在列表中自动高亮并出现在顶部提醒中。"
+          :title="`下次检查日期：${nextCheckDate(form.lastCheckDate, formCycle) || '请先填写最近检查日期'}`"
+          description="检查周期由古树保护科按保护级别核定；级别调整后旧检查待办会失效，需班组在本页按新级别重排。"
         />
       </el-form>
       <template #footer>
@@ -402,5 +514,9 @@ function handleFilterChange(key: string, value: string): void {
 
 :deep(.row-overdue) {
   --el-table-tr-bg-color: #fdf3f2;
+}
+
+:deep(.row-stale) {
+  --el-table-tr-bg-color: #fdf8ec;
 }
 </style>

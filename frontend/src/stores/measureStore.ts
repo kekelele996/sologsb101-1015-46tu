@@ -1,17 +1,22 @@
 /**
- * 复壮措施状态管理（Pinia）
- * 维护措施草稿、实施状态流转与批量操作；完成即回写古树最近复壮日期。
+ * 复壮措施状态管理（Pinia）——养护班组那份档案
+ * 维护措施草稿、实施状态流转与批量操作；
+ * 当年施工工日按古树保护级别核定，超容量的「计划」措施自动排队等下一批，
+ * 已确认（实施中 / 已完成）的措施不被挤掉；完成即回写古树最近复壮日期。
  */
 import { reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Measure, MeasureDraft, MeasureState, MeasureType } from '../types/measure'
 import {
   batchSetMeasureState,
+  capacityOf,
   db,
   initDatabase,
+  promoteQueuedMeasures,
   putMeasure,
   removeMeasure,
 } from '../utils/db'
+import { defaultWorkdays } from '../types/policy'
 import { nowIso, uuid } from '../utils/id'
 import { useTreeStore } from './treeStore'
 
@@ -21,6 +26,10 @@ export interface MeasureFilters {
   treeId: string | 'all'
   type: MeasureType | 'all'
   state: MeasureState | 'all'
+}
+
+function yearOf(date: string): number {
+  return /^\d{4}/.test(date) ? Number(date.slice(0, 4)) : new Date().getFullYear()
 }
 
 export const useMeasureStore = defineStore('measure', () => {
@@ -85,6 +94,7 @@ export const useMeasureStore = defineStore('measure', () => {
 
   async function createMeasure(draft: MeasureDraft): Promise<Measure> {
     const stamp = nowIso()
+    const workdays = draft.workdays && draft.workdays > 0 ? draft.workdays : defaultWorkdays(draft.type)
     const row: Measure = {
       id: uuid('measure'),
       treeId: draft.treeId,
@@ -93,16 +103,27 @@ export const useMeasureStore = defineStore('measure', () => {
       material: draft.material.trim(),
       operator: draft.operator.trim(),
       state: draft.state,
+      workdays,
+      planYear: yearOf(draft.date),
+      queueOrder: 0,
+      queueReason: '',
+      ownerSide: 'crew',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     }
+    // putMeasure 内部按核定容量决定是否转为「排队待批」
     await putMeasure(row)
     revision.value += 1
-    if (row.state === '已完成') {
+    const saved = (await db.measures.get(row.id)) ?? row
+    if (saved.state === '排队待批') {
+      lastMessage.value = `当年核定工日容量不足，该措施（${saved.workdays} 工日）已排队等下一批，已确认措施不受影响`
+    } else if (saved.state === '已完成') {
       lastMessage.value = '措施已登记为「已完成」，古树最近复壮日期已回写'
+    } else {
+      lastMessage.value = `复壮措施已排入 ${saved.planYear} 年度批次（核定 ${saved.workdays} 工日）`
     }
-    return row
+    return saved
   }
 
   async function updateMeasure(measureId: string, draft: MeasureDraft): Promise<void> {
@@ -116,6 +137,8 @@ export const useMeasureStore = defineStore('measure', () => {
       material: draft.material.trim(),
       operator: draft.operator.trim(),
       state: draft.state,
+      workdays: draft.workdays && draft.workdays > 0 ? draft.workdays : existing.workdays,
+      planYear: yearOf(draft.date),
     })
     revision.value += 1
   }
@@ -127,10 +150,21 @@ export const useMeasureStore = defineStore('measure', () => {
     revision.value += 1
   }
 
-  /** 推进到下一状态：计划 → 实施中 → 已完成 */
+  /** 推进到下一状态：排队待批 → 计划（受容量约束）→ 实施中 → 已完成 */
   async function advance(measureId: string): Promise<MeasureState | null> {
     const existing = await db.measures.get(measureId)
     if (!existing) return null
+    if (existing.state === '排队待批') {
+      const capacity = await capacityOf(existing.treeId, existing.planYear)
+      if (existing.workdays > capacity.remaining) {
+        lastMessage.value = `当年剩余核定工日仅 ${capacity.remaining}，不足 ${existing.workdays} 工日，该措施继续排队等下一批`
+        return '排队待批'
+      }
+      await putMeasure({ ...existing, state: '计划', queueOrder: 0, queueReason: '' })
+      revision.value += 1
+      lastMessage.value = '排队措施已排入当年批次'
+      return '计划'
+    }
     const flow: MeasureState[] = ['计划', '实施中', '已完成']
     const index = flow.indexOf(existing.state)
     if (index < 0 || index >= flow.length - 1) return null
@@ -150,6 +184,20 @@ export const useMeasureStore = defineStore('measure', () => {
     // 回写古树日期后，同步刷新古树统计
     await useTreeStore().refreshCounts()
     return count
+  }
+
+  /** 让排队措施按顺序尝试排入容量空出的当年批次；不挤掉任何已确认措施 */
+  async function promoteQueue(treeId?: string, year?: number): Promise<number> {
+    const count = await promoteQueuedMeasures(treeId, year)
+    revision.value += 1
+    lastMessage.value =
+      count > 0 ? `已按排队顺序把 ${count} 条措施排入当年批次` : '当前容量仍不足以排入更多排队措施'
+    return count
+  }
+
+  /** 读取某株古树某年度核定容量 */
+  async function capacity(treeId: string, year?: number) {
+    return capacityOf(treeId, year ?? new Date().getFullYear())
   }
 
   return {
@@ -173,5 +221,7 @@ export const useMeasureStore = defineStore('measure', () => {
     deleteMeasure,
     advance,
     batchSetState,
+    promoteQueue,
+    capacity,
   }
 })

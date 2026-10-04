@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * /trees/:id/surveys 树体与立地检查
- * 录树高 / 胸径 / 冠幅 / 倾斜 / 空洞并对比上次，展示古树历史时间线。
- * 消费模型：Survey、Tree；复用组件：<StatBadge>、<EmptyPanel>
+ * /trees/:id/surveys 树体与立地检查（养护班组那份档案）
+ * 录树高 / 胸径 / 冠幅 / 倾斜 / 空洞并对比上次，展示检查任务与古树历史时间线。
+ * 保护级别调整后，按旧级别排出的树体检查待办会失效，班组在本页按新级别重排；做完的检查照旧留住。
+ * 消费模型：Survey、Inspection、Tree；复用组件：<StatBadge>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -12,9 +13,11 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useTreeStore } from '@/stores/treeStore'
-import { db } from '@/utils/db'
+import { db, putSurvey, rescheduleSurveyCheck, ROW_REVISION } from '@/utils/db'
+import { policyOf } from '@/types/policy'
 import { SITE_NOTE_OPTIONS, type SiteNote, type Survey, type SurveyDraft } from '@/types/survey'
 import { LEAN_DANGER_DEG, LEAN_WATCH_DEG, annualGrowth, hollowRisk, leanLevel, siteAdvice } from '@/utils/dimension'
+import { nowIso, uuid } from '@/utils/id'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,8 +25,20 @@ const treeStore = useTreeStore()
 
 const treeId = computed<string>(() => String(route.params.id ?? ''))
 const tree = computed(() => treeStore.trees.find((item) => item.id === treeId.value) ?? null)
-const { rows, loading, create, update, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false })
+const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false })
 const { items } = useTreeHistory(treeId)
+
+/** 该古树的树体检查任务（含失效待重排与已完成留痕） */
+const surveyTasks = computed(() =>
+  treeStore
+    .inspectionsOf(treeId.value)
+    .filter((task) => task.kind === 'survey')
+    .sort((a, b) => b.dueDate.localeCompare(a.dueDate)),
+)
+const voidedSurveyTasks = computed(() => surveyTasks.value.filter((task) => task.voided))
+const pendingSurveyTask = computed(() =>
+  surveyTasks.value.find((task) => task.status === '待检查' && !task.voided) ?? null,
+)
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -131,10 +146,22 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await create({ ...form }, 'survey')
-      ElMessage.success('树体检查记录已登记')
+      const stamp = nowIso()
+      // 班组新检查：盖 crew 章，并在班组事务内收口到期待办检查任务
+      await putSurvey({
+        id: uuid('survey'),
+        ...form,
+        ownerSide: 'crew',
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      })
+      ElMessage.success('树体检查记录已登记（养护班组档案）')
     } else {
-      await update(editingId.value, { ...form })
+      const existing = await db.surveys.get(editingId.value)
+      if (existing) {
+        await putSurvey({ ...existing, ...form })
+      }
       ElMessage.success('检查记录已更新')
     }
     if (leanLevel(form.leanDeg) === 'danger') {
@@ -165,6 +192,19 @@ async function handleDelete(row: Survey): Promise<void> {
   await remove(row.id)
   ElMessage.success('检查记录已删除')
 }
+
+/** 班组按新保护级别重排树体检查：失效旧待办留痕，新建一条按新周期的待办任务 */
+async function handleRescheduleSurvey(): Promise<void> {
+  try {
+    const task = await rescheduleSurveyCheck(treeId.value)
+    ElMessage.success(`已按当前保护级别重排树体检查，下次检查日期：${task.dueDate}`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '重排失败')
+  }
+}
+
+/** 当前保护级别核定的树体检查周期（月） */
+const surveyCycle = computed<number>(() => (tree.value ? policyOf(tree.value.protectLevel).surveyCycleMon : 0))
 </script>
 
 <template>
@@ -252,6 +292,32 @@ async function handleDelete(row: Survey): Promise<void> {
         class="mb-14"
         :title="`倾斜度 ${latest.leanDeg}°，超过 ${leanLevel(latest.leanDeg) === 'danger' ? LEAN_DANGER_DEG : LEAN_WATCH_DEG}° 阈值`"
         :description="siteAdvice(latest.siteNote)"
+      />
+
+      <el-alert
+        v-if="tree && voidedSurveyTasks.length > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="保护级别已调整：按旧级别排出的树体检查已失效，需班组按新级别重排"
+      >
+        <template #default>
+          <div class="recheck-row">
+            <span>
+              现有保护级别「{{ tree.protectLevel }}」核定每 {{ surveyCycle }} 个月检查一次；已完成的检查历史照旧保留。
+            </span>
+            <el-button size="small" type="warning" plain @click="handleRescheduleSurvey">按新级别重排树体检查</el-button>
+          </div>
+        </template>
+      </el-alert>
+      <el-alert
+        v-else-if="tree && pendingSurveyTask"
+        type="info"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`下一次树体检查日期：${pendingSurveyTask.dueDate}（按${pendingSurveyTask.basisLevel} / 每 ${pendingSurveyTask.cycleMon} 个月核定）`"
       />
 
       <el-row :gutter="14">
@@ -465,5 +531,13 @@ async function handleDelete(row: Survey): Promise<void> {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.recheck-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 </style>

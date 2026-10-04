@@ -8,7 +8,8 @@
     "dev": "vite --host --port 22815",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22815",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "verify:rules": "tsx scripts/verify-rules.mts"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -21,6 +22,8 @@
   "devDependencies": {
     "@types/node": "^22.20.4",
     "@vitejs/plugin-vue": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
+    "tsx": "^4.23.15",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
     "vue-tsc": "^2.2.0"

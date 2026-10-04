@@ -1,7 +1,10 @@
 /**
- * 长势复评（Review）
+ * 长势复评（Review）——古树保护科档案
  * 长势为「衰弱」或「濒危」时必须填写后续措施。
+ * 保护级别调整必须与长势复评结论在保护科同一份档案内落库，
+ * 班组侧（检查 / 措施 / 加固件）的任何提交失败都不会回滚本份。
  */
+import type { OwnerSide } from './ownership'
 
 /** 长势等级 */
 export type Vigor = '旺盛' | '一般' | '衰弱' | '濒危'
@@ -29,6 +32,8 @@ export interface Review {
   conclusion: string
   /** 后续措施（长势为衰弱 / 濒危时必填） */
   followUp: string
+  /** 档案归属：固定为古树保护科 */
+  ownerSide: OwnerSide
   createdAt: string
   updatedAt: string
   revision: number

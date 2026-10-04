@@ -44,6 +44,14 @@ body {
   background: #fdf3f2 !important;
 }
 
+.el-table .row-stale td.el-table__cell {
+  background: #fdf8ec !important;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
+}
+
 @media (max-width: 900px) {
   .app-main {
     padding: 12px;

@@ -5,7 +5,7 @@
  * 状态改为「已完成」时回写古树最近复壮日期。
  * 消费模型：Measure、Tree；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
@@ -22,6 +22,7 @@ import {
   type MeasureState,
   type MeasureType,
 } from '@/types/measure'
+import { defaultWorkdays } from '@/types/policy'
 
 const treeStore = useTreeStore()
 const measureStore = useMeasureStore()
@@ -40,6 +41,7 @@ const form = reactive<MeasureDraft>({
   material: '',
   operator: '',
   state: '计划',
+  workdays: 2,
 })
 
 const rules: FormRules<MeasureDraft> = {
@@ -76,13 +78,51 @@ const stats = computed(() => {
   const total = rows.value.length
   const done = rows.value.filter((row) => row.state === '已完成').length
   const pending = rows.value.filter((row) => row.state !== '已完成').length
-  return { total, done, pending, donePct: total === 0 ? 0 : Math.round((done / total) * 1000) / 10 }
+  const queued = rows.value.filter((row) => row.state === '排队待批').length
+  return {
+    total,
+    done,
+    pending,
+    queued,
+    donePct: total === 0 ? 0 : Math.round((done / total) * 1000) / 10,
+  }
 })
+
+/** 当前选中古树的当年核定工日容量（保护级别核定） */
+const capacity = ref<{ quota: number; used: number; confirmed: number; remaining: number; queued: number; year: number } | null>(null)
+const capacityTreeId = ref('')
+
+async function refreshCapacity(): Promise<void> {
+  const treeId = measureStore.filters.treeId !== 'all' ? measureStore.filters.treeId : (treeStore.currentTreeId ?? '')
+  if (treeId === '') {
+    capacity.value = null
+    capacityTreeId.value = ''
+    return
+  }
+  capacityTreeId.value = treeId
+  capacity.value = await measureStore.capacity(treeId)
+}
+
+async function handlePromote(): Promise<void> {
+  const treeId = capacityTreeId.value || undefined
+  const count = await measureStore.promoteQueue(treeId)
+  if (count > 0) ElMessage.success(`已按排队顺序排入 ${count} 条措施`)
+  else ElMessage.info('当前核定容量仍不足以排入更多排队措施')
+  await refreshCapacity()
+}
 
 onMounted(() => {
   void treeStore.loadAll()
-  void measureStore.init()
+  void measureStore.init().then(refreshCapacity)
 })
+
+// 古树筛选切换 / 数据变化时刷新核定容量
+watch(
+  () => [measureStore.filters.treeId, treeStore.currentTreeId, measureStore.revision, rows.value.length],
+  () => {
+    void refreshCapacity()
+  },
+)
 
 function openCreate(): void {
   const treeId =
@@ -97,6 +137,7 @@ function openCreate(): void {
     material: '',
     operator: '',
     state: '计划' as MeasureState,
+    workdays: defaultWorkdays('施肥'),
   })
   dialogVisible.value = true
 }
@@ -110,6 +151,7 @@ function openEdit(row: Measure): void {
     material: row.material,
     operator: row.operator,
     state: row.state,
+    workdays: row.workdays,
   })
   dialogVisible.value = true
 }
@@ -121,13 +163,15 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await measureStore.createMeasure({ ...form })
-      ElMessage.success('复壮措施已登记')
+      const saved = await measureStore.createMeasure({ ...form })
+      ElMessage.success(measureStore.lastMessage || '复壮措施已登记')
+      if (saved.state === '排队待批') ElMessage.warning(measureStore.lastMessage)
     } else {
       await measureStore.updateMeasure(editingId.value, { ...form })
       ElMessage.success('复壮措施已更新')
     }
     dialogVisible.value = false
+    await refreshCapacity()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   } finally {
@@ -181,6 +225,14 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="待办措施" :value="stats.pending" suffix="项" tone="warning" icon="Warning" />
       <StatBadge label="已完成" :value="stats.done" suffix="项" tone="success" icon="DataLine" />
       <StatBadge
+        label="排队等下一批"
+        :value="stats.queued"
+        suffix="项"
+        :tone="stats.queued > 0 ? 'warning' : 'success'"
+        icon="Box"
+        hint="超出当年按保护级别核定工日容量的计划措施，已确认措施不被挤掉"
+      />
+      <StatBadge
         label="完成率"
         :value="`${stats.donePct}%`"
         :percent="stats.donePct"
@@ -189,6 +241,30 @@ function handleFilterChange(key: string, value: string): void {
       />
       <StatBadge label="筛选结果" :value="filtered.length" suffix="项" tone="info" icon="TrendCharts" size="small" />
     </div>
+
+    <el-alert
+      v-if="capacity"
+      :type="capacity.remaining === 0 ? 'warning' : 'success'"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`${capacity.year} 年度核定工日：${capacity.used} / ${capacity.quota}（其中已确认 ${capacity.confirmed} 工日，剩余可排 ${capacity.remaining} 工日）`"
+    >
+      <template #default>
+        <div class="capacity-row">
+          <span>工日按古树当前保护级别由保护科核定；已确认（实施中 / 已完成）措施不被新措施挤掉。</span>
+          <el-button
+            v-if="capacity.queued > 0"
+            size="small"
+            type="warning"
+            plain
+            @click="handlePromote"
+          >
+            排队 {{ capacity.queued }} 工日 · 尝试排入下一批
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <el-card shadow="never">
       <template #header>
@@ -282,6 +358,9 @@ function handleFilterChange(key: string, value: string): void {
             <el-tag type="success" effect="light">{{ row.type }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="核定工日" width="100" align="right">
+          <template #default="{ row }">{{ row.workdays }} 工日</template>
+        </el-table-column>
         <el-table-column label="实施日期" width="180">
           <template #default="{ row }">
             <el-date-picker
@@ -321,11 +400,20 @@ function handleFilterChange(key: string, value: string): void {
         <el-table-column label="实施状态" width="120">
           <template #default="{ row }">
             <el-tag
-              :type="row.state === '已完成' ? 'success' : row.state === '实施中' ? 'warning' : 'info'"
+              :type="row.state === '已完成' ? 'success' : row.state === '实施中' ? 'warning' : row.state === '排队待批' ? 'info' : 'primary'"
               effect="dark"
             >
               {{ row.state }}
             </el-tag>
+            <div v-if="row.state === '排队待批'" class="cell-sub">排队序号 {{ row.queueOrder }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="排队原因 / 归属" min-width="220">
+          <template #default="{ row }">
+            <el-tooltip v-if="row.state === '排队待批'" placement="top" :content="row.queueReason">
+              <el-tag type="info" effect="plain" size="small">超容量排队</el-tag>
+            </el-tooltip>
+            <el-tag v-else type="success" effect="plain" size="small">养护班组</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="草稿" width="150">
@@ -354,8 +442,8 @@ function handleFilterChange(key: string, value: string): void {
         </el-table-column>
         <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" :disabled="row.state === '已完成'" @click="handleAdvance(row)">
-              推进状态
+            <el-button link :type="row.state === '排队待批' ? 'warning' : 'primary'" size="small" :disabled="row.state === '已完成'" @click="handleAdvance(row)">
+              {{ row.state === '排队待批' ? '尝试排入' : '推进状态' }}
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
@@ -400,6 +488,13 @@ function handleFilterChange(key: string, value: string): void {
             </el-form-item>
           </el-col>
           <el-col :span="12">
+            <el-form-item label="核定工日">
+              <el-input-number v-model="form.workdays" :min="1" :max="200" :step="1" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="12">
+          <el-col :span="12">
             <el-form-item label="实施状态" prop="state">
               <el-select v-model="form.state" style="width: 100%">
                 <el-option v-for="item in MEASURE_STATE_OPTIONS" :key="item" :value="item" :label="item" />
@@ -412,6 +507,7 @@ function handleFilterChange(key: string, value: string): void {
           show-icon
           :closable="false"
           title="状态选择「已完成」时，会自动把该古树的最近复壮日期回写为上面的实施日期，并进入复评待办。"
+          :description="`「计划」措施按 ${form.workdays} 工日计入当年按保护级别核定的容量；容量不足时会自动转为「排队待批」等下一批，已确认（实施中 / 已完成）的措施不会被挤掉。`"
         />
       </el-form>
       <template #footer>
@@ -455,6 +551,18 @@ function handleFilterChange(key: string, value: string): void {
 .batch-label {
   font-size: 13px;
   color: #6b6257;
+}
+
+.capacity-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
 }
 
 .cell-stack {

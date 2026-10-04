@@ -1,11 +1,13 @@
 <script setup lang="ts">
 /**
- * /reviews 长势复评与结构版本
- * 复评增删改（衰弱 / 濒危强制填写后续措施）、古树历史时间线、JSON 导入导出与结构版本查看。
- * 消费模型：Review、Measure、全部模型；复用组件：<VigorTag>、<EmptyPanel>、<StatBadge>、<FilterBar>
+ * /reviews 长势复评与结构版本（古树保护科那份档案）
+ * 保护科维护：保护级别调整（可同期登记长势复评结论）、复评增删改（衰弱 / 濒危强制后续措施）、
+ * 古树历史时间线、JSON 导入导出与结构版本查看。
+ * 级别调整只提交保护科自己那份；班组侧检查失效挑取失败不会回滚级别调整。
+ * 消费模型：Review、Tree、Measure、全部模型；复用组件：<VigorTag>、<EmptyPanel>、<StatBadge>、<FilterBar>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules, type UploadFile } from 'element-plus'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
@@ -14,14 +16,19 @@ import VigorTag from '@/components/common/VigorTag.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useReviewStore } from '@/stores/reviewStore'
+import { useBureauStore } from '@/stores/bureauStore'
 import { useTreeStore } from '@/stores/treeStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot } from '@/utils/export'
+import { PROTECT_LEVEL_OPTIONS, type ProtectLevel, type Tree } from '@/types/tree'
+import { policyOf } from '@/types/policy'
 import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type ReviewDraft, type Trend, type Vigor } from '@/types/review'
 
+const route = useRoute()
 const router = useRouter()
 const treeStore = useTreeStore()
 const reviewStore = useReviewStore()
+const bureauStore = useBureauStore()
 
 const { rows, loading, remove } = useIdbTable<Review>(db.reviews, { sortByUpdatedAt: false })
 
@@ -30,6 +37,128 @@ const submitting = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const timelineTreeId = ref<string | null>(null)
+
+/* ---------------- 保护科：保护级别调整 ---------------- */
+const adjustVisible = ref(false)
+const adjustSubmitting = ref(false)
+const adjustFormRef = ref<FormInstance>()
+const adjustWithReview = ref(true)
+const adjustForm = reactive<{
+  treeId: string
+  level: ProtectLevel
+  date: string
+  vigor: Vigor
+  trend: Trend
+  conclusion: string
+  followUp: string
+}>({
+  treeId: '',
+  level: '二级',
+  date: new Date().toISOString().slice(0, 10),
+  vigor: '一般',
+  trend: '持平',
+  conclusion: '',
+  followUp: '',
+})
+
+const adjustNeedFollowUp = computed<boolean>(() => VIGOR_NEED_FOLLOW_UP.includes(adjustForm.vigor))
+
+const adjustRules = computed<FormRules>(() => ({
+  treeId: [{ required: true, message: '请选择古树', trigger: 'change' }],
+  level: [{ required: true, message: '请选择新保护级别', trigger: 'change' }],
+  date: [{ required: true, message: '请选择调整日期', trigger: 'change' }],
+  ...(adjustWithReview.value
+    ? {
+        vigor: [{ required: true, message: '请选择长势', trigger: 'change' }],
+        trend: [{ required: true, message: '请选择趋势', trigger: 'change' }],
+        conclusion: [{ required: true, message: '请填写复评结论', trigger: 'blur' }],
+        followUp: adjustNeedFollowUp.value
+          ? [{ required: true, message: '长势为衰弱 / 濒危时必须填写后续措施', trigger: 'blur' }]
+          : [],
+      }
+    : {}),
+}))
+
+const adjustTree = computed<Tree | null>(
+  () => treeStore.trees.find((tree) => tree.id === adjustForm.treeId) ?? null,
+)
+
+/** 级别调整对班组侧的影响预览（检查周期与工日容量变化） */
+const adjustImpact = computed(() => {
+  if (!adjustTree.value) return null
+  const from = policyOf(adjustTree.value.protectLevel)
+  const to = policyOf(adjustForm.level)
+  return {
+    same: adjustTree.value.protectLevel === adjustForm.level,
+    surveyFrom: from.surveyCycleMon,
+    surveyTo: to.surveyCycleMon,
+    supportFrom: from.supportCheckCycleMon,
+    supportTo: to.supportCheckCycleMon,
+    quotaFrom: from.annualWorkdayQuota,
+    quotaTo: to.annualWorkdayQuota,
+  }
+})
+
+function openAdjust(treeId?: string): void {
+  const target = treeId ?? treeStore.currentTreeId ?? treeStore.trees[0]?.id ?? ''
+  const tree = treeStore.trees.find((item) => item.id === target)
+  adjustForm.treeId = target
+  adjustForm.level = tree?.protectLevel ?? '二级'
+  adjustForm.date = new Date().toISOString().slice(0, 10)
+  adjustForm.vigor = '一般'
+  adjustForm.trend = '持平'
+  adjustForm.conclusion = ''
+  adjustForm.followUp = ''
+  adjustWithReview.value = true
+  adjustVisible.value = true
+}
+
+async function handleAdjustSubmit(): Promise<void> {
+  if (adjustFormRef.value === undefined) return
+  const valid = await adjustFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  if (adjustWithReview.value) {
+    const check = reviewStore.validate({
+      treeId: adjustForm.treeId,
+      date: adjustForm.date,
+      vigor: adjustForm.vigor,
+      trend: adjustForm.trend,
+      conclusion: adjustForm.conclusion,
+      followUp: adjustForm.followUp,
+    })
+    if (!check.ok) {
+      ElMessage.error(check.message)
+      return
+    }
+  }
+  adjustSubmitting.value = true
+  try {
+    const outcome = await bureauStore.adjustLevel(
+      adjustForm.treeId,
+      adjustForm.level,
+      adjustForm.date,
+      adjustWithReview.value
+        ? {
+            treeId: adjustForm.treeId,
+            date: adjustForm.date,
+            vigor: adjustForm.vigor,
+            trend: adjustForm.trend,
+            conclusion: adjustForm.conclusion,
+            followUp: adjustForm.followUp,
+          }
+        : null,
+    )
+    ElMessage.success(bureauStore.lastMessage)
+    if (!outcome.crewSyncOk) ElMessage.warning(bureauStore.lastWarning)
+    await treeStore.refreshCounts()
+    adjustVisible.value = false
+  } catch (error) {
+    // 保护科这份提交失败：只回滚保护科事务，班组档案未触碰
+    ElMessage.error(error instanceof Error ? error.message : '级别调整提交失败（保护科档案未变更）')
+  } finally {
+    adjustSubmitting.value = false
+  }
+}
 
 const form = reactive<ReviewDraft>({
   treeId: '',
@@ -84,7 +213,12 @@ const weakCount = computed<number>(
 onMounted(() => {
   void treeStore.loadAll()
   void reviewStore.init()
-  timelineTreeId.value = treeStore.currentTreeId
+  const queryTreeId = typeof route.query.treeId === 'string' ? route.query.treeId : ''
+  timelineTreeId.value = queryTreeId || treeStore.currentTreeId
+  // 从古档案页「级别调整」入口带 ?adjust=1 跳转过来：自动打开保护科调整对话框
+  if (route.query.adjust === '1') {
+    openAdjust(queryTreeId || (treeStore.currentTreeId ?? undefined))
+  }
 })
 
 function openCreate(): void {
@@ -256,6 +390,16 @@ function handleFilterChange(key: string, value: string): void {
       description="请到复评列表中补充后续措施（换土、透气、树洞修补、加固等），否则无法通过复评校验。"
     />
 
+    <el-alert
+      v-if="treeStore.crewRecheckCount > 0"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`保护级别调整后，有 ${treeStore.crewRecheckCount} 项班组检查待重排（${treeStore.voidedInspections.length} 个待办已失效）`"
+      description="已按旧级别核定的树体检查 / 加固件检查已挑出作废，做完的检查历史照旧保留；请通知养护班组在树体检查页与加固件页按新级别重排。"
+    />
+
     <el-row :gutter="14">
       <el-col :xs="24" :lg="17">
         <el-card shadow="never">
@@ -283,6 +427,10 @@ function handleFilterChange(key: string, value: string): void {
                   </el-button>
                 </el-upload>
                 <el-button type="danger" plain @click="handleReset">重置演示数据</el-button>
+                <el-button type="warning" @click="openAdjust()" :disabled="treeStore.trees.length === 0">
+                  <el-icon><SetUp /></el-icon>
+                  <span>保护级别调整</span>
+                </el-button>
                 <el-button type="primary" @click="openCreate" :disabled="treeStore.trees.length === 0">
                   <el-icon><Plus /></el-icon>
                   <span>新增复评</span>
@@ -341,6 +489,18 @@ function handleFilterChange(key: string, value: string): void {
               </template>
             </el-table-column>
             <el-table-column prop="date" label="复评日期" width="120" />
+            <el-table-column label="归属 / 级别" width="120">
+              <template #default="{ row }">
+                <el-tag type="warning" size="small" effect="plain">保护科</el-tag>
+                <el-tag
+                  class="mt-2"
+                  size="small"
+                  :type="(treeStore.trees.find((tree) => tree.id === row.treeId)?.protectLevel) === '一级' ? 'danger' : 'info'"
+                >
+                  {{ treeStore.trees.find((tree) => tree.id === row.treeId)?.protectLevel ?? '—' }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="长势" width="160">
               <template #default="{ row }">
                 <VigorTag :vigor="row.vigor" :trend="row.trend" />
@@ -472,6 +632,98 @@ function handleFilterChange(key: string, value: string): void {
         <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 古树保护科：保护级别调整（与本次复评结论在保护科同一份档案内提交） -->
+    <el-dialog v-model="adjustVisible" title="保护科调整保护级别" width="680px">
+      <el-form ref="adjustFormRef" :model="adjustForm" :rules="adjustRules" label-width="110px">
+        <el-form-item label="古树" prop="treeId">
+          <el-select v-model="adjustForm.treeId" filterable style="width: 100%">
+            <el-option
+              v-for="tree in treeStore.trees"
+              :key="tree.id"
+              :value="tree.id"
+              :label="`${tree.code} · ${tree.species} · ${tree.location}`"
+            />
+          </el-select>
+        </el-form-item>
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="新保护级别" prop="level">
+              <el-select v-model="adjustForm.level" style="width: 100%">
+                <el-option v-for="item in PROTECT_LEVEL_OPTIONS" :key="item" :value="item" :label="item" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="调整日期" prop="date">
+              <el-date-picker v-model="adjustForm.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-alert
+          v-if="adjustImpact"
+          :type="adjustImpact.same ? 'info' : 'warning'"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          :title="adjustImpact.same ? '保护级别未变化，仅登记复评结论。' : `核定标准：${adjustTree?.protectLevel} → ${adjustForm.level}`"
+          :description="`树体检查 ${adjustImpact.surveyFrom} → ${adjustImpact.surveyTo} 个月 / 次；加固件检查 ${adjustImpact.supportFrom} → ${adjustImpact.supportTo} 个月 / 次；当年复壮施工工日 ${adjustImpact.quotaFrom} → ${adjustImpact.quotaTo} 工日。级别一生效，按旧级别排出的待办检查即失效，挑出等班组重排；已完成的检查与已确认措施照旧留住。`"
+        />
+
+        <el-form-item label="同期登记复评">
+          <el-switch v-model="adjustWithReview" />
+          <span class="cell-sub ml-8">级别调整与长势复评结论同属保护科这份档案，建议一并提交</span>
+        </el-form-item>
+
+        <template v-if="adjustWithReview">
+          <el-row :gutter="12">
+            <el-col :span="8">
+              <el-form-item label="复评日期" prop="date">
+                <el-date-picker v-model="adjustForm.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="长势" prop="vigor">
+                <el-select v-model="adjustForm.vigor" style="width: 100%">
+                  <el-option v-for="item in VIGOR_OPTIONS" :key="item" :value="item" :label="item" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="趋势" prop="trend">
+                <el-select v-model="adjustForm.trend" style="width: 100%">
+                  <el-option v-for="item in TREND_OPTIONS" :key="item" :value="item" :label="item" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-form-item label="复评结论" prop="conclusion">
+            <el-input v-model="adjustForm.conclusion" type="textarea" :rows="2" placeholder="如：经年度复评，树势濒危程度提升，建议升为一级保护。" />
+          </el-form-item>
+          <el-form-item label="后续措施" prop="followUp">
+            <el-input
+              v-model="adjustForm.followUp"
+              type="textarea"
+              :rows="2"
+              :placeholder="adjustNeedFollowUp ? '长势为衰弱 / 濒危，必填' : '可选：填写下一步保护安排'"
+            />
+          </el-form-item>
+        </template>
+
+        <el-alert
+          type="success"
+          show-icon
+          :closable="false"
+          title="本操作只提交古树保护科这份档案（保护级别 + 复评结论）"
+          description="提交后班组侧的失效检查挑取若失败，只会保留在班组那份重试，不会回滚已生效的级别调整与复评结论。"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="adjustVisible = false">取消</el-button>
+        <el-button type="warning" :loading="adjustSubmitting" @click="handleAdjustSubmit">提交级别调整</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -529,5 +781,13 @@ function handleFilterChange(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.mt-2 {
+  margin-top: 4px;
+}
+
+.ml-8 {
+  margin-left: 8px;
 }
 </style>

@@ -2,6 +2,9 @@
  * 古树档案状态管理（Pinia）
  * 维护古树列表、当前选中古树、筛选条件与古树级派生统计；
  * 通过 Dexie liveQuery 订阅全量数据，写操作落库后自动回灌。
+ *
+ * 归属边界：本 store 只做读侧聚合；保护级别调整走 bureauStore，
+ * 检查 / 措施 / 加固件写入走各自班组入口，互不越界。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -11,15 +14,19 @@ import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
 import type { Support } from '../types/support'
 import type { Review, Trend, Vigor } from '../types/review'
+import type { Inspection } from '../types/inspection'
 import { VIGOR_NEED_FOLLOW_UP } from '../types/review'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
+  capacityOf,
   countAll,
   db,
   initDatabase,
   putTree,
   removeTree,
+  updateTreeBase,
+  type CapacityInfo,
 } from '../utils/db'
 import { nowIso, uuid } from '../utils/id'
 import {
@@ -54,6 +61,7 @@ export interface TreeStat {
   measureCount: number
   doneMeasureCount: number
   pendingMeasureCount: number
+  queuedMeasureCount: number
   supportCount: number
   /** 超周期未检查的加固件数 */
   overdueCount: number
@@ -62,6 +70,10 @@ export interface TreeStat {
   latestTrend: Trend | null
   /** 是否需要填写后续措施（最新长势为衰弱 / 濒危） */
   needFollowUp: boolean
+  /** 级别调整后已失效、等班组重排的检查任务数 */
+  voidedInspectionCount: number
+  /** 检查周期仍停留在旧保护级别的加固件数（待按新级别重排） */
+  staleSupportCount: number
 }
 
 const CURRENT_TREE_KEY = 'gbheritagetree:currentTreeId'
@@ -94,12 +106,15 @@ const EMPTY_STAT: Omit<TreeStat, 'treeId'> = {
   measureCount: 0,
   doneMeasureCount: 0,
   pendingMeasureCount: 0,
+  queuedMeasureCount: 0,
   supportCount: 0,
   overdueCount: 0,
   reviewCount: 0,
   latestVigor: null,
   latestTrend: null,
   needFollowUp: false,
+  voidedInspectionCount: 0,
+  staleSupportCount: 0,
 }
 
 let subscribed = false
@@ -110,6 +125,7 @@ export const useTreeStore = defineStore('tree', () => {
   const measures = ref<Measure[]>([])
   const supports = ref<Support[]>([])
   const reviews = ref<Review[]>([])
+  const inspections = ref<Inspection[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -136,6 +152,7 @@ export const useTreeStore = defineStore('tree', () => {
         .filter((row) => row.treeId === tree.id)
         .sort((a, b) => a.date.localeCompare(b.date))
       const latestReview = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
+      const treeInspections = inspections.value.filter((row) => row.treeId === tree.id)
       const lean = latest === null ? 'safe' : leanLevel(latest.leanDeg)
       result[tree.id] = {
         treeId: tree.id,
@@ -154,13 +171,19 @@ export const useTreeStore = defineStore('tree', () => {
         hollowCount: latest === null ? 0 : latest.hollowCount,
         measureCount: treeMeasures.length,
         doneMeasureCount: treeMeasures.filter((row) => row.state === '已完成').length,
-        pendingMeasureCount: treeMeasures.filter((row) => row.state !== '已完成').length,
+        pendingMeasureCount: treeMeasures.filter((row) => row.state === '计划' || row.state === '实施中').length,
+        queuedMeasureCount: treeMeasures.filter((row) => row.state === '排队待批').length,
         supportCount: treeSupports.length,
-        overdueCount: treeSupports.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon)).length,
+        overdueCount: treeSupports
+          // 待重排（级别失效）的加固件不参与普通超期高亮，统一进入待重排队列
+          .filter((row) => row.basisLevel === tree.protectLevel && isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+          .length,
         reviewCount: treeReviews.length,
         latestVigor: latestReview === null ? null : latestReview.vigor,
         latestTrend: latestReview === null ? null : latestReview.trend,
         needFollowUp: latestReview !== null && VIGOR_NEED_FOLLOW_UP.includes(latestReview.vigor),
+        voidedInspectionCount: treeInspections.filter((row) => row.voided).length,
+        staleSupportCount: treeSupports.filter((row) => row.basisLevel !== tree.protectLevel).length,
       }
     })
     return result
@@ -185,12 +208,58 @@ export const useTreeStore = defineStore('tree', () => {
     () => trees.value.find((tree) => tree.id === currentTreeId.value) ?? null
   )
 
+  /** 超周期未检查（且检查周期仍对应当前保护级别）的加固件 */
   const overdueSupports = computed<Support[]>(() =>
-    supports.value.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+    supports.value.filter((row) => {
+      const tree = trees.value.find((item) => item.id === row.treeId)
+      if (tree && row.basisLevel !== tree.protectLevel) return false
+      return isSupportOverdue(row.lastCheckDate, row.checkCycleMon)
+    }),
+  )
+
+  /** 级别调整后等班组重排的检查任务（已失效待办，已完成的历史不在其中） */
+  const voidedInspections = computed<Inspection[]>(() =>
+    inspections.value
+      .filter((row) => row.voided)
+      .sort((a, b) => a.treeId.localeCompare(b.treeId) || a.kind.localeCompare(b.kind))
+  )
+
+  /** 检查周期依据级别已过期的加固件（班组需按新级别重排） */
+  const staleSupports = computed<Support[]>(() =>
+    supports.value.filter((row) => {
+      const tree = trees.value.find((item) => item.id === row.treeId)
+      return tree !== undefined && row.basisLevel !== tree.protectLevel
+    }),
+  )
+
+  /** 待班组重排的措施项：失效检查任务 + 旧级别加固件，按古树去重提示 */
+  const crewRecheckCount = computed<number>(() => {
+    const supportIds = new Set(staleSupports.value.map((row) => row.id))
+    const surveyVoids = new Set(
+      voidedInspections.value.filter((row) => row.kind === 'survey').map((row) => row.treeId),
+    )
+    return supportIds.size + surveyVoids.size
+  })
+
+  /** 全部排队等下一批的复壮措施 */
+  const queuedMeasures = computed<Measure[]>(() =>
+    measures.value
+      .filter((row) => row.state === '排队待批')
+      .sort((a, b) => a.queueOrder - b.queueOrder || a.date.localeCompare(b.date))
   )
 
   function statOf(treeId: string): TreeStat {
     return stats.value[treeId] ?? { treeId, ...EMPTY_STAT }
+  }
+
+  function inspectionsOf(treeId: string): Inspection[] {
+    return inspections.value
+      .filter((row) => row.treeId === treeId)
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+  }
+
+  async function loadCapacity(treeId: string, year = new Date().getFullYear()): Promise<CapacityInfo> {
+    return capacityOf(treeId, year)
   }
 
   async function loadAll(): Promise<void> {
@@ -201,22 +270,24 @@ export const useTreeStore = defineStore('tree', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [treeRows, surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
+          const [treeRows, surveyRows, measureRows, supportRows, reviewRows, inspectionRows] = await Promise.all([
             db.trees.toArray(),
             db.surveys.toArray(),
             db.measures.toArray(),
             db.supports.toArray(),
             db.reviews.toArray(),
+            db.inspections.toArray(),
           ])
-          return { treeRows, surveyRows, measureRows, supportRows, reviewRows }
+          return { treeRows, surveyRows, measureRows, supportRows, reviewRows, inspectionRows }
         }).subscribe({
-          next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows }) => {
+          next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows, inspectionRows }) => {
             const sorted = [...treeRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             trees.value = sorted
             surveys.value = surveyRows
             measures.value = measureRows
             supports.value = supportRows
             reviews.value = reviewRows
+            inspections.value = inspectionRows
             loading.value = false
             ready.value = true
             error.value = ''
@@ -261,6 +332,7 @@ export const useTreeStore = defineStore('tree', () => {
       code: draft.code.trim() || '未编号',
       species: draft.species.trim() || '未鉴定',
       protectLevel: draft.protectLevel,
+      levelChangedDate: '',
       ageYears: draft.ageYears,
       location: draft.location.trim(),
       owner: draft.owner.trim(),
@@ -274,14 +346,14 @@ export const useTreeStore = defineStore('tree', () => {
     return row
   }
 
+  /**
+   * 编辑古树共享基础信息（编号 / 树种 / 树龄 / 位置 / 管护单位）。
+   * 不含保护级别——保护级别只能由保护科经级别调整流程修改。
+   */
   async function updateTree(treeId: string, draft: TreeDraft): Promise<void> {
-    const existing = await db.trees.get(treeId)
-    if (!existing) return
-    await putTree({
-      ...existing,
-      code: draft.code.trim() || existing.code,
-      species: draft.species.trim() || existing.species,
-      protectLevel: draft.protectLevel,
+    await updateTreeBase(treeId, {
+      code: draft.code.trim(),
+      species: draft.species.trim(),
       ageYears: draft.ageYears,
       location: draft.location.trim(),
       owner: draft.owner.trim(),
@@ -305,6 +377,7 @@ export const useTreeStore = defineStore('tree', () => {
     measures,
     supports,
     reviews,
+    inspections,
     loading,
     ready,
     error,
@@ -316,7 +389,13 @@ export const useTreeStore = defineStore('tree', () => {
     stats,
     visibleTrees,
     overdueSupports,
+    voidedInspections,
+    staleSupports,
+    crewRecheckCount,
+    queuedMeasures,
     statOf,
+    inspectionsOf,
+    loadCapacity,
     loadAll,
     selectTree,
     setFilters,

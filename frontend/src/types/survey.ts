@@ -1,7 +1,10 @@
 /**
- * 树体检查（Survey）
+ * 树体检查（Survey）——养护班组档案
  * 每次检查记录树高、胸径、冠幅、倾斜度、空洞数与立地状况。
+ * 保护级别一调整，按旧级别排出的检查计划即失效：
+ * 已完成的检查记录照旧留住，仅待办检查任务（inspections）失效等班组重排。
  */
+import type { OwnerSide } from './ownership'
 
 /** 立地状况：铺装 / 裸土 / 积水 */
 export type SiteNote = '铺装' | '裸土' | '积水'
@@ -26,6 +29,8 @@ export interface Survey {
   hollowCount: number
   /** 立地状况 */
   siteNote: SiteNote
+  /** 档案归属：固定为养护班组 */
+  ownerSide: OwnerSide
   createdAt: string
   updatedAt: string
   revision: number

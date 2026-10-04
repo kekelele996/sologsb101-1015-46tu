@@ -66,13 +66,19 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
+  // inspections 为 v3 新增，旧版（v2）存档允许缺失，导入时按空数组处理
   const collections: Array<keyof DatabaseSnapshot> = ['trees', 'surveys', 'measures', 'supports', 'reviews']
   for (const key of collections) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  const base = data as DatabaseSnapshot
+  return {
+    ok: true,
+    message: '存档校验通过。',
+    snapshot: { ...base, inspections: Array.isArray(base.inspections) ? base.inspections : [] },
+  }
 }
 
 /** 生成古树养护总览 CSV（一树一行） */
