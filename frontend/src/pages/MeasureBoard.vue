@@ -13,18 +13,22 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useMeasureStore } from '@/stores/measureStore'
 import { useTreeStore } from '@/stores/treeStore'
+import { useAccessStore } from '@/stores/accessStore'
 import { db } from '@/utils/db'
+import { workdayQuota } from '@/utils/capacity'
 import {
   MEASURE_STATE_OPTIONS,
   MEASURE_TYPE_OPTIONS,
   type Measure,
   type MeasureDraft,
+  type MeasureQueueState,
   type MeasureState,
   type MeasureType,
 } from '@/types/measure'
 
 const treeStore = useTreeStore()
 const measureStore = useMeasureStore()
+const access = useAccessStore()
 
 const { rows, loading } = useIdbTable<Measure>(db.measures, { sortByUpdatedAt: false })
 
@@ -40,6 +44,7 @@ const form = reactive<MeasureDraft>({
   material: '',
   operator: '',
   state: '计划',
+  workdays: 4,
 })
 
 const rules: FormRules<MeasureDraft> = {
@@ -49,11 +54,15 @@ const rules: FormRules<MeasureDraft> = {
   material: [{ required: true, message: '请填写材料', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写负责人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择实施状态', trigger: 'change' }],
+  workdays: [{ required: true, message: '请核定施工工日', trigger: 'blur' }],
 }
 
 const treeLabel = computed<Record<string, string>>(() =>
   Object.fromEntries(treeStore.trees.map((tree) => [tree.id, `${tree.code} ${tree.species}`]))
 )
+
+/** 编辑表单当前选树 / 选日期对应的容量提示 */
+const formCapacity = computed(() => measureStore.capacityOf(form.treeId, form.date))
 
 const filtered = computed<Measure[]>(() => {
   const keyword = measureStore.filters.keyword.trim().toLowerCase()
@@ -62,6 +71,7 @@ const filtered = computed<Measure[]>(() => {
       if (measureStore.filters.treeId !== 'all' && row.treeId !== measureStore.filters.treeId) return false
       if (measureStore.filters.type !== 'all' && row.type !== measureStore.filters.type) return false
       if (measureStore.filters.state !== 'all' && row.state !== measureStore.filters.state) return false
+      if (measureStore.filters.queue !== 'all' && row.queueState !== measureStore.filters.queue) return false
       if (keyword === '') return true
       return (
         (treeLabel.value[row.treeId] ?? '').toLowerCase().includes(keyword) ||
@@ -76,7 +86,8 @@ const stats = computed(() => {
   const total = rows.value.length
   const done = rows.value.filter((row) => row.state === '已完成').length
   const pending = rows.value.filter((row) => row.state !== '已完成').length
-  return { total, done, pending, donePct: total === 0 ? 0 : Math.round((done / total) * 1000) / 10 }
+  const queued = rows.value.filter((row) => row.queueState === '排队中').length
+  return { total, done, pending, queued, donePct: total === 0 ? 0 : Math.round((done / total) * 1000) / 10 }
 })
 
 onMounted(() => {
@@ -97,8 +108,14 @@ function openCreate(): void {
     material: '',
     operator: '',
     state: '计划' as MeasureState,
+    workdays: measureStore.defaultWorkdays('施肥'),
   })
   dialogVisible.value = true
+}
+
+/** 切换措施类型时带出默认工日（仍可人工改） */
+function handleTypeChange(type: MeasureType): void {
+  form.workdays = measureStore.defaultWorkdays(type)
 }
 
 function openEdit(row: Measure): void {
@@ -110,6 +127,7 @@ function openEdit(row: Measure): void {
     material: row.material,
     operator: row.operator,
     state: row.state,
+    workdays: row.workdays,
   })
   dialogVisible.value = true
 }
@@ -167,10 +185,16 @@ async function handleBatchState(): Promise<void> {
   ElMessage.success(`已把 ${count} 条措施状态改为「${measureStore.stateDraft}」`)
 }
 
+async function handleConfirmNextBatch(): Promise<void> {
+  const count = await measureStore.confirmNextBatch()
+  ElMessage.success(count > 0 ? `${count} 条排队措施已确认进入下一批` : '当前容量不足，继续排队')
+}
+
 function handleFilterChange(key: string, value: string): void {
   if (key === 'treeId') measureStore.setFilters({ treeId: value })
   if (key === 'type') measureStore.setFilters({ type: value as MeasureType | 'all' })
   if (key === 'state') measureStore.setFilters({ state: value as MeasureState | 'all' })
+  if (key === 'queue') measureStore.setFilters({ queue: value as MeasureQueueState | 'all' })
 }
 </script>
 
@@ -181,6 +205,14 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="待办措施" :value="stats.pending" suffix="项" tone="warning" icon="Warning" />
       <StatBadge label="已完成" :value="stats.done" suffix="项" tone="success" icon="DataLine" />
       <StatBadge
+        label="排队等下一批"
+        :value="stats.queued"
+        suffix="项"
+        :tone="stats.queued > 0 ? 'danger' : 'success'"
+        icon="Warning"
+        hint="超出当年级别核定工日容量，已排队且不会挤掉已确认措施"
+      />
+      <StatBadge
         label="完成率"
         :value="`${stats.donePct}%`"
         :percent="stats.donePct"
@@ -189,6 +221,15 @@ function handleFilterChange(key: string, value: string): void {
       />
       <StatBadge label="筛选结果" :value="filtered.length" suffix="项" tone="info" icon="TrendCharts" size="small" />
     </div>
+
+    <el-alert
+      v-if="!access.isCrew"
+      type="info"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      title="复壮措施归养护班组安排，保护科身份只读，改不到班组这份。"
+    />
 
     <el-card shadow="never">
       <template #header>
@@ -212,11 +253,13 @@ function handleFilterChange(key: string, value: string): void {
           },
           { key: 'type', label: '措施类型', options: MEASURE_TYPE_OPTIONS as unknown as string[] },
           { key: 'state', label: '实施状态', options: MEASURE_STATE_OPTIONS as unknown as string[] },
+          { key: 'queue', label: '批次', options: ['已确认', '排队中'] },
         ]"
         :values="{
           treeId: measureStore.filters.treeId,
           type: measureStore.filters.type,
           state: measureStore.filters.state,
+          queue: measureStore.filters.queue,
         }"
         :result-text="`命中 ${filtered.length} / ${rows.length} 项`"
         @update:keyword="(value: string) => measureStore.setFilters({ keyword: value })"
@@ -243,6 +286,14 @@ function handleFilterChange(key: string, value: string): void {
           @click="handleBatchState"
         >
           批量调整实施状态
+        </el-button>
+        <el-button
+          type="warning"
+          plain
+          :disabled="measureStore.queuedRows.length === 0"
+          @click="handleConfirmNextBatch"
+        >
+          按容量确认下一批（{{ measureStore.queuedRows.length }} 项排队）
         </el-button>
         <el-button :disabled="measureStore.selectedIds.length === 0" @click="measureStore.setSelectedIds([])">
           取消选择
@@ -272,14 +323,29 @@ function handleFilterChange(key: string, value: string): void {
             <div class="cell-stack">
               <span>{{ treeLabel[row.treeId] ?? '（古树已删除）' }}</span>
               <span class="cell-sub">
-                最近复壮：{{ treeStore.trees.find((tree) => tree.id === row.treeId)?.lastMeasureDate || '未登记' }}
+                最近复壮：{{ treeStore.latestMeasureDateOf(row.treeId) || '未登记' }}
               </span>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="措施类型" width="130">
+        <el-table-column label="措施类型" width="120">
           <template #default="{ row }">
             <el-tag type="success" effect="light">{{ row.type }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="施工工日" width="100" align="right">
+          <template #default="{ row }">{{ row.workdays }} 工日</template>
+        </el-table-column>
+        <el-table-column label="批次 / 容量" width="120">
+          <template #default="{ row }">
+            <el-tooltip
+              :content="`该株${row.date.slice(0, 4)} 年保护级别核定容量 ${workdayQuota(treeStore.trees.find((t) => t.id === row.treeId)?.protectLevel ?? '三级')} 工日`"
+              placement="top"
+            >
+              <el-tag :type="row.queueState === '排队中' ? 'danger' : 'success'" effect="plain" size="small">
+                {{ row.queueState }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="实施日期" width="180">
@@ -379,7 +445,7 @@ function handleFilterChange(key: string, value: string): void {
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="措施类型" prop="type">
-              <el-select v-model="form.type" style="width: 100%">
+              <el-select v-model="form.type" style="width: 100%" @change="handleTypeChange">
                 <el-option v-for="item in MEASURE_TYPE_OPTIONS" :key="item" :value="item" :label="item" />
               </el-select>
             </el-form-item>
@@ -390,13 +456,10 @@ function handleFilterChange(key: string, value: string): void {
             </el-form-item>
           </el-col>
         </el-row>
-        <el-form-item label="材料" prop="material">
-          <el-input v-model="form.material" type="textarea" :rows="2" placeholder="如：基质土 6 m³ + 草炭土 2 m³" />
-        </el-form-item>
         <el-row :gutter="12">
           <el-col :span="12">
-            <el-form-item label="负责人" prop="operator">
-              <el-input v-model="form.operator" placeholder="如：王建军" />
+            <el-form-item label="施工工日" prop="workdays">
+              <el-input-number v-model="form.workdays" :min="0.5" :max="200" :step="0.5" style="width: 100%" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -407,11 +470,28 @@ function handleFilterChange(key: string, value: string): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item label="材料" prop="material">
+          <el-input v-model="form.material" type="textarea" :rows="2" placeholder="如：基质土 6 m³ + 草炭土 2 m³" />
+        </el-form-item>
+        <el-form-item label="负责人" prop="operator">
+          <el-input v-model="form.operator" placeholder="如：王建军" />
+        </el-form-item>
+        <el-alert
+          v-if="formCapacity.year !== ''"
+          :type="formCapacity.remaining - form.workdays >= 0 ? 'success' : 'warning'"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          :title="`${formCapacity.year} 年保护级别核定容量 ${formCapacity.quota} 工日，当前剩余 ${formCapacity.remaining} 工日，本措施 ${form.workdays} 工日`"
+          :description="formCapacity.remaining - form.workdays >= 0
+            ? '容量充足，保存后确认为本批措施。'
+            : '超出容量：保存后排入下一批（排队中），不会挤掉任何已确认措施。'"
+        />
         <el-alert
           type="info"
           show-icon
           :closable="false"
-          title="状态选择「已完成」时，会自动把该古树的最近复壮日期回写为上面的实施日期，并进入复评待办。"
+          title="当年复壮施工工日按古树保护级别核定；超容量自动排队等下一批，已确认的措施不受影响。状态改为「已完成」视同确认。"
         />
       </el-form>
       <template #footer>
@@ -455,6 +535,10 @@ function handleFilterChange(key: string, value: string): void {
 .batch-label {
   font-size: 13px;
   color: #6b6257;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
 }
 
 .cell-stack {

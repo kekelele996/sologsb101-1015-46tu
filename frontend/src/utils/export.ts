@@ -116,6 +116,12 @@ export function buildTreeCsv(
     const treeReviews = reviews.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestReview = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
     const overdue = treeSupports.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+    // 最近复壮日期由已完成措施派生（不再回写古树档案，两侧解耦）
+    const latestMeasure =
+      treeMeasures
+        .filter((row) => row.state === '已完成')
+        .map((row) => row.date)
+        .sort((a, b) => b.localeCompare(a))[0] ?? ''
     lines.push(
       [
         tree.code,
@@ -134,7 +140,7 @@ export function buildTreeCsv(
         latest === null ? '—' : latest.siteNote,
         treeMeasures.length,
         treeMeasures.filter((row) => row.state === '已完成').length,
-        tree.lastMeasureDate === '' ? '—' : tree.lastMeasureDate,
+        latestMeasure === '' ? '—' : latestMeasure,
         treeSupports.length,
         overdue.length === 0 ? '无' : overdue.map((row) => `${row.type}超期 ${overdueDays(row.lastCheckDate, row.checkCycleMon)} 天`).join('；'),
         treeReviews.length,

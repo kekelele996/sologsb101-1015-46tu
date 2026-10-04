@@ -1,6 +1,8 @@
 /**
- * 长势复评状态管理（Pinia）
+ * 长势复评状态管理（Pinia）—— 古树保护科档案
  * 维护长势筛选条件与复评结论派生值；长势为衰弱 / 濒危时强制填写后续措施。
+ * 归属：仅古树保护科可写（accessStore.canWrite('bureau')）；写库只动 reviews 表，
+ * 班组措施 / 检查提交失败不会影响这份，复评提交失败也只回滚保护科自己。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -8,6 +10,7 @@ import type { Review, ReviewDraft, Trend, Vigor } from '../types/review'
 import { VIGOR_NEED_FOLLOW_UP, VIGOR_OPTIONS } from '../types/review'
 import { db, initDatabase, putReview, removeReview } from '../utils/db'
 import { nowIso, uuid } from '../utils/id'
+import { useAccessStore } from './accessStore'
 import { useTreeStore } from './treeStore'
 
 /** 长势复评筛选条件 */
@@ -25,10 +28,16 @@ export interface ReviewValidation {
 }
 
 export const useReviewStore = defineStore('review', () => {
+  const access = useAccessStore()
   const filters = reactive<ReviewFilters>({ keyword: '', treeId: 'all', vigor: 'all', trend: 'all' })
   const selectedIds = ref<string[]>([])
   const lastMessage = ref('')
   const revision = ref(0)
+
+  /** 保护科写操作闸门：班组身份改不到保护科这份 */
+  function assertBureauWritable(): void {
+    if (!access.canWrite('bureau')) throw new Error(access.deniedMessage('bureau'))
+  }
 
   /** 长势分布统计，供复评页徽标使用 */
   const vigorStats = computed<Record<Vigor, number>>(() => {
@@ -89,6 +98,7 @@ export const useReviewStore = defineStore('review', () => {
   }
 
   async function createReview(draft: ReviewDraft): Promise<Review | null> {
+    assertBureauWritable()
     const check = validate(draft)
     if (!check.ok) {
       lastMessage.value = check.message
@@ -103,6 +113,7 @@ export const useReviewStore = defineStore('review', () => {
       trend: draft.trend,
       conclusion: draft.conclusion.trim(),
       followUp: draft.followUp.trim(),
+      ownerScope: 'bureau',
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,
@@ -114,6 +125,7 @@ export const useReviewStore = defineStore('review', () => {
   }
 
   async function updateReview(reviewId: string, draft: ReviewDraft): Promise<ReviewValidation> {
+    assertBureauWritable()
     const check = validate(draft)
     if (!check.ok) {
       lastMessage.value = check.message
@@ -136,6 +148,7 @@ export const useReviewStore = defineStore('review', () => {
   }
 
   async function deleteReview(reviewId: string): Promise<void> {
+    assertBureauWritable()
     await removeReview(reviewId)
     selectedIds.value = selectedIds.value.filter((id) => id !== reviewId)
     revision.value += 1

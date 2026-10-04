@@ -40,6 +40,8 @@ export function buildHistory(
 ): HistoryItem[] {
   const items: HistoryItem[] = []
   surveys.forEach((row) => {
+    // 按级别派出、尚未完成的检查任务是待办，不进入已发生的历史时间线
+    if (!row.isDone) return
     items.push({
       key: `survey-${row.id}`,
       kind: 'survey',

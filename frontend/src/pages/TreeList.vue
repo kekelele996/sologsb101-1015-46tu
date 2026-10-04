@@ -2,7 +2,10 @@
 /**
  * /trees 古树一树一档
  * 新建档案、按保护级别与树种筛选、回显检查次数与最新长势等级、级联删除。
- * 消费模型：Tree、Review、Survey、Measure、Support；复用组件：<VigorTag>、<FilterBar>、<StatBadge>、<EmptyPanel>
+ * 两侧分家：
+ * - 「编辑档案」改身份 / 基础字段（两侧均可），但表单不允许动保护级别；
+ * - 「调整保护级别」是古树保护科专属动作，只写保护科那份，调整后旧级别任务失效由班组重排。
+ * 消费模型：Tree、Review、Survey、Measure、Support；复用组件：<VigorTag>、<FilterBar>、<StatBadge>、<EmptyPanel>、<ScopeTag>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -12,6 +15,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import VigorTag from '@/components/common/VigorTag.vue'
 import { useTreeStore } from '@/stores/treeStore'
+import { useAccessStore } from '@/stores/accessStore'
 import {
   PROTECT_LEVEL_OPTIONS,
   TREE_SPECIES_CANDIDATES,
@@ -19,13 +23,17 @@ import {
   type Tree,
   type TreeDraft,
 } from '@/types/tree'
+import { today } from '@/utils/id'
 
 const router = useRouter()
 const treeStore = useTreeStore()
+const access = useAccessStore()
 
 const dialogVisible = ref(false)
+const levelDialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
+const levelTreeId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 
 const form = reactive<TreeDraft>({
@@ -35,6 +43,12 @@ const form = reactive<TreeDraft>({
   ageYears: 120,
   location: '',
   owner: '',
+})
+
+/** 保护科调级别用的小表单（只含级别与生效日期，动不到基础字段） */
+const levelForm = reactive<{ protectLevel: ProtectLevel; date: string }>({
+  protectLevel: '二级',
+  date: today(),
 })
 
 const rules: FormRules<TreeDraft> = {
@@ -64,7 +78,8 @@ const totals = computed(() => {
     return vigor === '衰弱' || vigor === '濒危'
   }).length
   const overdue = list.reduce((acc, tree) => acc + treeStore.statOf(tree.id).overdueCount, 0)
-  return { level1, weak, overdue }
+  const queued = list.reduce((acc, tree) => acc + treeStore.statOf(tree.id).queuedMeasureCount, 0)
+  return { level1, weak, overdue, queued }
 })
 
 onMounted(() => {
@@ -97,6 +112,13 @@ function openEdit(row: Tree): void {
   dialogVisible.value = true
 }
 
+function openLevelDialog(row: Tree): void {
+  levelTreeId.value = row.id
+  levelForm.protectLevel = row.protectLevel
+  levelForm.date = today()
+  levelDialogVisible.value = true
+}
+
 async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
   const valid = await formRef.value.validate().catch(() => false)
@@ -108,11 +130,27 @@ async function handleSubmit(): Promise<void> {
       ElMessage.success(`已建立古树档案「${row.code}」，可继续登记树体检查`)
     } else {
       await treeStore.updateTree(editingId.value, { ...form })
-      ElMessage.success('古树档案已更新')
+      ElMessage.success('古树档案已更新（保护级别由保护科单独调整，未在本次改动）')
     }
     dialogVisible.value = false
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function handleLevelSubmit(): Promise<void> {
+  if (levelTreeId.value === null) return
+  submitting.value = true
+  try {
+    const updated = await treeStore.adjustLevel(levelTreeId.value, levelForm.protectLevel, levelForm.date)
+    ElMessage.success(
+      `保护级别已由${updated.previousProtectLevel || '未定级'}调整为「${updated.protectLevel}」；按旧级别安排、尚未完成的检查与加固件检查已挑出，等班组按新级别重排，已完成的照旧留住。`
+    )
+    levelDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '调整失败')
   } finally {
     submitting.value = false
   }
@@ -150,6 +188,7 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="一级古树" :value="totals.level1" suffix="株" tone="success" icon="DataLine" />
       <StatBadge label="衰弱/濒危" :value="totals.weak" suffix="株" tone="danger" icon="Warning" hint="最新长势为衰弱或濒危的古树" />
       <StatBadge label="加固件超期" :value="totals.overdue" suffix="件" tone="warning" icon="Warning" hint="超过检查周期未检查的加固件" />
+      <StatBadge label="排队措施" :value="totals.queued" suffix="项" tone="warning" icon="Warning" hint="超出当年级别核定工日、排队等下一批的措施" />
       <StatBadge label="筛选结果" :value="rows.length" suffix="株" tone="info" icon="PieChart" size="small" />
     </div>
 
@@ -163,6 +202,17 @@ function handleFilterChange(key: string, value: string): void {
           </el-button>
         </div>
       </template>
+
+      <el-alert
+        class="mb-14"
+        :type="access.isBureau ? 'warning' : 'success'"
+        show-icon
+        :closable="false"
+        :title="`当前身份：${access.roleLabel}`"
+        :description="access.isBureau
+          ? '保护科管保护级别与长势复评结论：可在此调整级别、在「长势复评」页出结论；树体检查、复壮措施、加固件由养护班组登记，保护科改不到。'
+          : '养护班组管树体检查、复壮措施与加固件：可登记检查 / 排措施 / 检查加固件；保护级别与复评结论由保护科定，班组顶不回去。'"
+      />
 
       <FilterBar
         :keyword="treeStore.filters.keyword"
@@ -201,14 +251,19 @@ function handleFilterChange(key: string, value: string): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="保护级别" width="110">
+        <el-table-column label="保护级别（保护科）" width="150">
           <template #default="{ row }">
-            <el-tag :type="row.protectLevel === '一级' ? 'danger' : row.protectLevel === '二级' ? 'warning' : 'info'">
-              {{ row.protectLevel }}
-            </el-tag>
+            <div class="cell-stack">
+              <el-tag :type="row.protectLevel === '一级' ? 'danger' : row.protectLevel === '二级' ? 'warning' : 'info'">
+                {{ row.protectLevel }}
+              </el-tag>
+              <span v-if="row.protectLevelChangedAt !== ''" class="cell-sub">
+                {{ row.protectLevelChangedAt }} 由{{ row.previousProtectLevel }}调整
+              </span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="位置 / 管护单位" min-width="240">
+        <el-table-column label="位置 / 管护单位" min-width="220">
           <template #default="{ row }">
             <div class="cell-stack">
               <span>{{ row.location }}</span>
@@ -216,7 +271,7 @@ function handleFilterChange(key: string, value: string): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="检查次数" width="110" align="right">
+        <el-table-column label="检查次数" width="100" align="right">
           <template #default="{ row }">{{ treeStore.statOf(row.id).surveyCount }} 次</template>
         </el-table-column>
         <el-table-column label="最新长势" width="170">
@@ -227,44 +282,54 @@ function handleFilterChange(key: string, value: string): void {
             />
           </template>
         </el-table-column>
-        <el-table-column label="倾斜度" width="130">
+        <el-table-column label="待重排 / 排队" width="140" align="center">
           <template #default="{ row }">
-            <span v-if="treeStore.statOf(row.id).latestSurvey === null" class="cell-sub">未检查</span>
-            <el-tag
-              v-else
-              :type="treeStore.statOf(row.id).lean === 'danger' ? 'danger' : treeStore.statOf(row.id).lean === 'watch' ? 'warning' : 'success'"
-              size="small"
+            <el-tooltip
+              v-if="treeStore.statOf(row.id).staleSurveyCount + treeStore.statOf(row.id).staleSupportCount > 0"
+              content="保护级别调整后，按旧级别安排、尚未完成的检查与加固件检查已失效，等班组重排"
+              placement="top"
             >
-              {{ treeStore.statOf(row.id).latestSurvey?.leanDeg }}° {{ treeStore.statOf(row.id).leanLabel }}
-            </el-tag>
+              <el-tag type="danger" size="small" effect="dark">
+                待重排 {{ treeStore.statOf(row.id).staleSurveyCount + treeStore.statOf(row.id).staleSupportCount }}
+              </el-tag>
+            </el-tooltip>
+            <el-tooltip
+              v-if="treeStore.statOf(row.id).queuedMeasureCount > 0"
+              content="超出当年级别核定工日，排队等下一批"
+              placement="top"
+            >
+              <el-tag type="warning" size="small" effect="plain" class="mt-2">
+                排队 {{ treeStore.statOf(row.id).queuedMeasureCount }}
+              </el-tag>
+            </el-tooltip>
+            <span v-if="treeStore.statOf(row.id).staleSurveyCount + treeStore.statOf(row.id).staleSupportCount === 0 && treeStore.statOf(row.id).queuedMeasureCount === 0" class="cell-sub">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="待办措施" width="110" align="right">
-          <template #default="{ row }">{{ treeStore.statOf(row.id).pendingMeasureCount }} 项</template>
-        </el-table-column>
-        <el-table-column label="加固件超期" width="120" align="right">
+        <el-table-column label="最近复壮" width="120">
           <template #default="{ row }">
-            <span :class="{ 'cell-warn': treeStore.statOf(row.id).overdueCount > 0 }">
-              {{ treeStore.statOf(row.id).overdueCount }} 件
-            </span>
+            <span v-if="treeStore.latestMeasureDateOf(row.id) === ''" class="cell-sub">未登记</span>
+            <span v-else>{{ treeStore.latestMeasureDateOf(row.id) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="最近复壮" width="130">
-          <template #default="{ row }">
-            <span v-if="row.lastMeasureDate === ''" class="cell-sub">未登记</span>
-            <span v-else>{{ row.lastMeasureDate }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="290" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click.stop="goSurveys(row)">树体检查</el-button>
-            <el-button link type="primary" size="small" @click.stop="openEdit(row)">编辑</el-button>
+            <el-button link type="primary" size="small" @click.stop="openEdit(row)">编辑档案</el-button>
+            <el-button
+              link
+              :type="access.isBureau ? 'warning' : 'info'"
+              size="small"
+              @click.stop="access.isBureau ? openLevelDialog(row) : ElMessage.info(access.deniedMessage('bureau'))"
+            >
+              调级别
+            </el-button>
             <el-button link type="danger" size="small" @click.stop="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
 
+    <!-- 古树档案身份 / 基础字段表单（保护级别只读展示，编辑改不到） -->
     <el-dialog
       v-model="dialogVisible"
       :title="editingId === null ? '新建古树档案' : '编辑古树档案'"
@@ -288,7 +353,7 @@ function handleFilterChange(key: string, value: string): void {
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="保护级别" prop="protectLevel">
-              <el-select v-model="form.protectLevel" style="width: 100%">
+              <el-select v-model="form.protectLevel" :disabled="editingId !== null" style="width: 100%">
                 <el-option v-for="item in PROTECT_LEVEL_OPTIONS" :key="item" :value="item" :label="item" />
               </el-select>
             </el-form-item>
@@ -309,12 +374,39 @@ function handleFilterChange(key: string, value: string): void {
           type="info"
           :closable="false"
           show-icon
-          title="保存后该株古树会成为「当前古树」，可直接进入树体检查页登记检查记录。"
+          :title="editingId === null
+            ? '建档时给定初始保护级别；之后级别调整由古树保护科在列表「调级别」中单独完成。'
+            : '保护级别是保护科档案，本表单不允许修改；如需调整请由保护科点「调级别」。'"
         />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 保护科专属：调整保护级别（独立小档案，只含级别 + 生效日期） -->
+    <el-dialog v-model="levelDialogVisible" title="古树保护科 · 调整保护级别" width="480px">
+      <el-form label-width="110px">
+        <el-form-item label="新生效级别">
+          <el-select v-model="levelForm.protectLevel" style="width: 100%">
+            <el-option v-for="item in PROTECT_LEVEL_OPTIONS" :key="item" :value="item" :label="item" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="生效日期">
+          <el-date-picker v-model="levelForm.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        title="调整只改保护科这份"
+        description="保护级别一经调整，按旧级别派出且尚未完成的树体检查、尚未检查的加固件检查立即失效，挑出等养护班组按新级别重排；已完成的检查与已确认的复壮措施照旧留住。"
+      />
+      <template #footer>
+        <el-button @click="levelDialogVisible = false">取消</el-button>
+        <el-button type="warning" :loading="submitting" @click="handleLevelSubmit">确认调整</el-button>
       </template>
     </el-dialog>
   </div>
@@ -356,5 +448,13 @@ function handleFilterChange(key: string, value: string): void {
 .cell-warn {
   color: #c0392b;
   font-weight: 600;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
+}
+
+.mt-2 {
+  margin-top: 4px;
 }
 </style>

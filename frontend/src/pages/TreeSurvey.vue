@@ -1,24 +1,32 @@
 <script setup lang="ts">
 /**
- * /trees/:id/surveys 树体与立地检查
+ * /trees/:id/surveys 树体与立地检查 —— 养护班组档案
  * 录树高 / 胸径 / 冠幅 / 倾斜 / 空洞并对比上次，展示古树历史时间线。
- * 消费模型：Survey、Tree；复用组件：<StatBadge>、<EmptyPanel>
+ * 保护级别调整后：按旧级别派出、尚未完成的检查任务失效（红色「待重排」），
+ * 班组一键按新级别重排；已完成的检查照旧留住。
+ * 消费模型：Survey、Tree；复用组件：<StatBadge>、<EmptyPanel>、<ScopeTag>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import ScopeTag from '@/components/common/ScopeTag.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useTreeStore } from '@/stores/treeStore'
-import { db } from '@/utils/db'
+import { useAccessStore } from '@/stores/accessStore'
+import { createScheduledSurveyTask, db, requeueSurveyTasks } from '@/utils/db'
+import { isSurveyTaskStale, LEVEL_SURVEY_CYCLE_MON } from '@/utils/capacity'
+import { addMonths } from '@/utils/dimension'
 import { SITE_NOTE_OPTIONS, type SiteNote, type Survey, type SurveyDraft } from '@/types/survey'
 import { LEAN_DANGER_DEG, LEAN_WATCH_DEG, annualGrowth, hollowRisk, leanLevel, siteAdvice } from '@/utils/dimension'
+import { today } from '@/utils/id'
 
 const route = useRoute()
 const router = useRouter()
 const treeStore = useTreeStore()
+const access = useAccessStore()
 
 const treeId = computed<string>(() => String(route.params.id ?? ''))
 const tree = computed(() => treeStore.trees.find((item) => item.id === treeId.value) ?? null)
@@ -51,11 +59,23 @@ const rules: FormRules<SurveyDraft> = {
   siteNote: [{ required: true, message: '请选择立地状况', trigger: 'change' }],
 }
 
-/** 该株古树的检查记录，按日期升序 */
+/** 已完成的检查记录（用于生长量等派生），按日期升序 */
 const surveys = computed<Survey[]>(() =>
   rows.value
-    .filter((row) => row.treeId === treeId.value)
+    .filter((row) => row.treeId === treeId.value && row.isDone)
     .sort((a, b) => a.date.localeCompare(b.date))
+)
+
+/** 按级别派出、尚未完成的检查任务 */
+const pendingTasks = computed<Survey[]>(() =>
+  rows.value
+    .filter((row) => row.treeId === treeId.value && !row.isDone && row.taskState !== '')
+    .sort((a, b) => a.date.localeCompare(b.date))
+)
+
+/** 保护级别调整后失效待重排的任务 */
+const staleTasks = computed<Survey[]>(() =>
+  pendingTasks.value.filter((row) => tree.value !== null && isSurveyTaskStale(row, tree.value))
 )
 
 /** 表格展示顺序：日期倒序 */
@@ -94,11 +114,18 @@ onMounted(() => {
   void treeStore.loadAll()
 })
 
+function assertCrew(): boolean {
+  if (access.canWrite('crew')) return true
+  ElMessage.info(access.deniedMessage('crew'))
+  return false
+}
+
 function openCreate(): void {
+  if (!assertCrew()) return
   editingId.value = null
   Object.assign(form, {
     treeId: treeId.value,
-    date: new Date().toISOString().slice(0, 10),
+    date: today(),
     heightM: latest.value === null ? 12 : latest.value.heightM,
     dbhCm: latest.value === null ? 60 : latest.value.dbhCm,
     crownM: latest.value === null ? 8 : latest.value.crownM,
@@ -107,6 +134,45 @@ function openCreate(): void {
     siteNote: latest.value === null ? ('裸土' as SiteNote) : latest.value.siteNote,
   })
   dialogVisible.value = true
+}
+
+/** 班组按当前保护级别应做的检查排一次任务（未完成，等下一次检查） */
+async function scheduleTask(): Promise<void> {
+  if (!assertCrew() || tree.value === null) return
+  const cycle = LEVEL_SURVEY_CYCLE_MON[tree.value.protectLevel]
+  const base = latest.value?.date ?? today()
+  await createScheduledSurveyTask({
+    treeId: treeId.value,
+    taskLevel: tree.value.protectLevel,
+    date: addMonths(base, cycle) || today(),
+  })
+  ElMessage.success(`已按「${tree.value.protectLevel}」派出检查任务（建议每 ${cycle} 个月一次）`)
+}
+
+/** 打开一条失效 / 待做任务，直接录检查结果（录完即完成留档） */
+function openTaskFill(row: Survey): void {
+  if (!assertCrew()) return
+  editingId.value = row.id
+  Object.assign(form, {
+    treeId: row.treeId,
+    date: row.date && row.date >= today() ? today() : row.date,
+    heightM: latest.value === null ? 12 : latest.value.heightM,
+    dbhCm: latest.value === null ? 60 : latest.value.dbhCm,
+    crownM: latest.value === null ? 8 : latest.value.crownM,
+    leanDeg: latest.value === null ? 2 : latest.value.leanDeg,
+    hollowCount: latest.value === null ? 0 : latest.value.hollowCount,
+    siteNote: latest.value === null ? ('裸土' as SiteNote) : latest.value.siteNote,
+  })
+  dialogVisible.value = true
+}
+
+/** 班组重排：把失效任务改挂到新保护级别（任务保留，做完的不受影响） */
+async function requeueStale(): Promise<void> {
+  if (!assertCrew() || tree.value === null) return
+  const ids = staleTasks.value.map((row) => row.id)
+  if (ids.length === 0) return
+  const count = await requeueSurveyTasks(ids, tree.value.protectLevel)
+  ElMessage.success(`已把 ${count} 条失效检查任务按「${tree.value.protectLevel}」重新排好`)
 }
 
 function openEdit(row: Survey): void {
@@ -131,11 +197,19 @@ async function handleSubmit(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value === null) {
-      await create({ ...form }, 'survey')
+      // 普通补录：班组自己的检查记录
+      await create({ ...form, ownerScope: 'crew', taskState: '', taskLevel: '', isDone: true }, 'survey')
       ElMessage.success('树体检查记录已登记')
     } else {
-      await update(editingId.value, { ...form })
-      ElMessage.success('检查记录已更新')
+      const existing = rows.value.find((row) => row.id === editingId.value)
+      // 保存一条任务即视为本次检查已做完：永久留档，级别再调整也不会被顶掉
+      await update(editingId.value, {
+        ...form,
+        isDone: true,
+        taskState: '',
+        taskLevel: existing?.taskLevel ?? '',
+      })
+      ElMessage.success(existing?.isDone === false ? '检查任务已完成并留档' : '检查记录已更新')
     }
     if (leanLevel(form.leanDeg) === 'danger') {
       ElMessage({
@@ -153,6 +227,7 @@ async function handleSubmit(): Promise<void> {
 }
 
 async function handleDelete(row: Survey): Promise<void> {
+  if (!assertCrew()) return
   try {
     await ElMessageBox.confirm(`确认删除 ${row.date} 的检查记录？`, '删除确认', {
       type: 'warning',
@@ -172,6 +247,7 @@ async function handleDelete(row: Survey): Promise<void> {
     <el-page-header :content="tree === null ? '树体检查' : `${tree.code} · ${tree.species}`" @back="router.push('/trees')">
       <template #extra>
         <el-space>
+          <ScopeTag v-if="tree" scope="crew" size="small" />
           <el-tag v-if="tree" :type="tree.protectLevel === '一级' ? 'danger' : tree.protectLevel === '二级' ? 'warning' : 'info'">
             {{ tree.protectLevel }}
           </el-tag>
@@ -194,21 +270,32 @@ async function handleDelete(row: Survey): Promise<void> {
     </EmptyPanel>
 
     <template v-else>
+      <el-alert
+        v-if="!access.isCrew"
+        type="info"
+        show-icon
+        :closable="false"
+        class="mt-14 mb-14"
+        title="树体检查归养护班组登记，保护科身份只读，改不到班组这份。"
+      />
+
       <div class="stat-row">
-        <StatBadge label="检查次数" :value="surveys.length" suffix="次" tone="primary" icon="Histogram" />
+        <StatBadge label="已完成检查" :value="surveys.length" suffix="次" tone="primary" icon="Histogram" />
+        <StatBadge label="待办任务" :value="pendingTasks.length - staleTasks.length" suffix="项" tone="info" icon="DataLine" />
+        <StatBadge
+          label="级别调整待重排"
+          :value="staleTasks.length"
+          suffix="项"
+          :tone="staleTasks.length > 0 ? 'danger' : 'success'"
+          icon="Warning"
+          hint="按旧级别派出、尚未完成；保护级别调整后已失效，等班组按新级别重排"
+        />
         <StatBadge
           label="最新树高"
           :value="latest === null ? '—' : latest.heightM"
           suffix="m"
           tone="info"
           icon="DataLine"
-        />
-        <StatBadge
-          label="最新胸径"
-          :value="latest === null ? '—' : latest.dbhCm"
-          suffix="cm"
-          tone="success"
-          icon="TrendCharts"
         />
         <StatBadge
           label="树高年生长量"
@@ -219,11 +306,18 @@ async function handleDelete(row: Survey): Promise<void> {
           hint="由最近两次检查的树高差按天数年化"
         />
         <StatBadge
+          label="最新胸径"
+          :value="latest === null ? '—' : latest.dbhCm"
+          suffix="cm"
+          tone="success"
+          icon="TrendCharts"
+        />
+        <StatBadge
           label="胸径年生长量"
           :value="annual.dbh"
           suffix="cm/年"
           tone="success"
-          icon="TrendCharts"
+          icon="DataLine"
         />
         <StatBadge
           label="空洞风险"
@@ -254,16 +348,60 @@ async function handleDelete(row: Survey): Promise<void> {
         :description="siteAdvice(latest.siteNote)"
       />
 
+      <!-- 级别派出的检查任务：含失效待重排 -->
+      <el-card v-if="pendingTasks.length > 0" shadow="never" class="mb-14">
+        <template #header>
+          <div class="card-header">
+            <span class="card-header__title">按保护级别应做的检查任务</span>
+            <el-button v-if="staleTasks.length > 0" type="danger" plain @click="requeueStale">
+              按新级别重排失效任务（{{ staleTasks.length }}）
+            </el-button>
+          </div>
+        </template>
+        <el-table :data="pendingTasks" row-key="id" stripe size="small">
+          <el-table-column prop="date" label="计划检查日期" width="140" />
+          <el-table-column label="派出依据级别" width="140">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.taskLevel === tree?.protectLevel ? 'success' : 'danger'" effect="plain">
+                {{ row.taskLevel }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="220">
+            <template #default="{ row }">
+              <el-tag v-if="isSurveyTaskStale(row, tree!)" type="danger" effect="dark">
+                级别已调整为{{ tree?.protectLevel }}，任务失效 · 待重排
+              </el-tag>
+              <el-tag v-else type="warning" effect="light">已安排 · 待检查</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="180" align="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="openTaskFill(row)">
+                {{ isSurveyTaskStale(row, tree!) ? '重排并录入检查' : '录入检查' }}
+              </el-button>
+              <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-card>
+
       <el-row :gutter="14">
         <el-col :xs="24" :lg="16">
           <el-card shadow="never">
             <template #header>
               <div class="card-header">
-                <span class="card-header__title">树体与立地检查记录</span>
-                <el-button type="primary" @click="openCreate">
-                  <el-icon><Plus /></el-icon>
-                  <span>新增检查</span>
-                </el-button>
+                <span class="card-header__title">树体与立地检查记录（已完成）</span>
+                <el-space>
+                  <el-button :disabled="tree === null" @click="scheduleTask">
+                    <el-icon><AlarmClock /></el-icon>
+                    <span>按级别排检查任务</span>
+                  </el-button>
+                  <el-button type="primary" @click="openCreate">
+                    <el-icon><Plus /></el-icon>
+                    <span>新增检查</span>
+                  </el-button>
+                </el-space>
               </div>
             </template>
 
@@ -301,7 +439,7 @@ async function handleDelete(row: Survey): Promise<void> {
                   </div>
                 </template>
               </el-table-column>
-              <el-table-column label="倾斜度" width="130">
+              <el-table-column label="倾斜度" width="110">
                 <template #default="{ row }">
                   <el-tag
                     size="small"
@@ -311,10 +449,10 @@ async function handleDelete(row: Survey): Promise<void> {
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="空洞" width="90" align="right">
+              <el-table-column label="空洞" width="80" align="right">
                 <template #default="{ row }">{{ row.hollowCount }} 处</template>
               </el-table-column>
-              <el-table-column label="立地状况" width="110">
+              <el-table-column label="立地状况" width="100">
                 <template #default="{ row }">
                   <el-tag size="small" type="info">{{ row.siteNote }}</el-tag>
                 </template>
@@ -352,7 +490,7 @@ async function handleDelete(row: Survey): Promise<void> {
       </el-row>
     </template>
 
-    <el-dialog v-model="dialogVisible" :title="editingId === null ? '新增树体检查' : '编辑树体检查'" width="660px">
+    <el-dialog v-model="dialogVisible" :title="editingId === null ? '新增树体检查' : '录入 / 编辑树体检查'" width="660px">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-row :gutter="12">
           <el-col :span="12">

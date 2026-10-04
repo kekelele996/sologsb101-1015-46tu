@@ -11,10 +11,12 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import VigorTag from '@/components/common/VigorTag.vue'
+import ScopeTag from '@/components/common/ScopeTag.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useReviewStore } from '@/stores/reviewStore'
 import { useTreeStore } from '@/stores/treeStore'
+import { useAccessStore } from '@/stores/accessStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot } from '@/utils/export'
 import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type ReviewDraft, type Trend, type Vigor } from '@/types/review'
@@ -22,6 +24,7 @@ import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type R
 const router = useRouter()
 const treeStore = useTreeStore()
 const reviewStore = useReviewStore()
+const access = useAccessStore()
 
 const { rows, loading, remove } = useIdbTable<Review>(db.reviews, { sortByUpdatedAt: false })
 
@@ -247,6 +250,15 @@ function handleFilterChange(key: string, value: string): void {
     </div>
 
     <el-alert
+      v-if="!access.isBureau"
+      type="info"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      title="保护级别与长势复评结论归古树保护科，养护班组身份只读，顶不回保护科定好的结论。"
+    />
+
+    <el-alert
       v-if="reviewStore.followUpMissing > 0"
       type="error"
       show-icon
@@ -283,7 +295,11 @@ function handleFilterChange(key: string, value: string): void {
                   </el-button>
                 </el-upload>
                 <el-button type="danger" plain @click="handleReset">重置演示数据</el-button>
-                <el-button type="primary" @click="openCreate" :disabled="treeStore.trees.length === 0">
+                <el-button
+                  type="primary"
+                  :disabled="treeStore.trees.length === 0 || !access.isBureau"
+                  @click="access.isBureau ? openCreate() : ElMessage.info(access.deniedMessage('bureau'))"
+                >
                   <el-icon><Plus /></el-icon>
                   <span>新增复评</span>
                 </el-button>
@@ -336,11 +352,16 @@ function handleFilterChange(key: string, value: string): void {
                   <el-link type="primary" @click.stop="router.push(`/trees/${row.treeId}/surveys`)">
                     {{ treeLabel[row.treeId] ?? '（古树已删除）' }}
                   </el-link>
-                  <span class="cell-sub">最近复壮：{{ treeStore.trees.find((tree) => tree.id === row.treeId)?.lastMeasureDate || '未登记' }}</span>
+                  <span class="cell-sub">最近复壮：{{ treeStore.latestMeasureDateOf(row.treeId) || '未登记' }}</span>
                 </div>
               </template>
             </el-table-column>
             <el-table-column prop="date" label="复评日期" width="120" />
+            <el-table-column label="归属" width="110">
+              <template #default>
+                <ScopeTag scope="bureau" size="small" />
+              </template>
+            </el-table-column>
             <el-table-column label="长势" width="160">
               <template #default="{ row }">
                 <VigorTag :vigor="row.vigor" :trend="row.trend" />
@@ -366,8 +387,22 @@ function handleFilterChange(key: string, value: string): void {
             </el-table-column>
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" size="small" @click.stop="openEdit(row)">编辑</el-button>
-                <el-button link type="danger" size="small" @click.stop="handleDelete(row)">删除</el-button>
+                <el-button
+                  link
+                  :type="access.isBureau ? 'primary' : 'info'"
+                  size="small"
+                  @click.stop="access.isBureau ? openEdit(row) : ElMessage.info(access.deniedMessage('bureau'))"
+                >
+                  编辑
+                </el-button>
+                <el-button
+                  link
+                  :type="access.isBureau ? 'danger' : 'info'"
+                  size="small"
+                  @click.stop="access.isBureau ? handleDelete(row) : ElMessage.info(access.deniedMessage('bureau'))"
+                >
+                  删除
+                </el-button>
               </template>
             </el-table-column>
           </el-table>

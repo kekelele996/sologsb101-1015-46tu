@@ -9,6 +9,8 @@ import { Coin, Files, FirstAidKit, Histogram, OfficeBuilding } from '@element-pl
 import { useTreeStore } from '@/stores/treeStore'
 import { useMeasureStore } from '@/stores/measureStore'
 import { useReviewStore } from '@/stores/reviewStore'
+import { useAccessStore } from '@/stores/accessStore'
+import { OWNER_SCOPE_LABEL, OWNER_SCOPE_OPTIONS, type OwnerScope } from '@/types/tree'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,6 +18,7 @@ const router = useRouter()
 const treeStore = useTreeStore()
 const measureStore = useMeasureStore()
 const reviewStore = useReviewStore()
+const access = useAccessStore()
 
 const navItems = computed(() => {
   const currentTreeId = treeStore.currentTreeId
@@ -43,6 +46,7 @@ const activePath = computed<string>(() => {
 })
 
 const overdueCount = computed<number>(() => treeStore.overdueSupports.length)
+const staleCount = computed<number>(() => treeStore.staleTaskTotal)
 
 onMounted(() => {
   void treeStore.loadAll()
@@ -81,11 +85,26 @@ function go(path: string): void {
         </button>
       </nav>
       <div class="app-header__meta">
+        <el-radio-group
+          :model-value="access.role"
+          size="small"
+          @update:model-value="(value: string | number | boolean) => access.setRole(value as OwnerScope)"
+        >
+          <el-radio-button
+            v-for="scope in OWNER_SCOPE_OPTIONS"
+            :key="scope"
+            :value="scope"
+            :label="scope"
+          >
+            {{ OWNER_SCOPE_LABEL[scope] }}
+          </el-radio-button>
+        </el-radio-group>
         <el-tag v-if="treeStore.currentTree" type="success" effect="dark">
           当前古树：{{ treeStore.currentTree.code }} {{ treeStore.currentTree.species }}
         </el-tag>
         <el-tag v-else type="info">未选择古树</el-tag>
         <el-tag v-if="overdueCount > 0" type="danger" effect="dark">加固件超期 {{ overdueCount }} 件</el-tag>
+        <el-tag v-if="staleCount > 0" type="warning" effect="dark">级别调整待重排 {{ staleCount }} 项</el-tag>
       </div>
     </header>
 
@@ -97,7 +116,7 @@ function go(path: string): void {
 
     <footer class="app-footer">
       <span>数据仅存于本浏览器（IndexedDB 库名 gbheritagetree / localStorage），不上传任何服务器。</span>
-      <span>结构版本 v{{ treeStore.counts.schemaVersion ?? '-' }}</span>
+      <span>结构版本 v{{ treeStore.counts.schemaVersion ?? '-' }} · 当前身份：{{ access.roleLabel }}</span>
     </footer>
   </div>
 </template>
